@@ -10,6 +10,7 @@ SHELL_UNAME = $(shell uname)
 REMOVE_FILES = rm -f
 OUTPUT_FILE = -o $@
 CUDA_OUTPUT_FILE = -o $@
+SYCL_OUTPUT_FILE = -o $@
 
 # Default O3 CPU optimization level for NVCC (0 for fastest compile time)
 FORCE_NVCC_O ?= 3
@@ -24,6 +25,63 @@ NCLL_INCUDES =
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
+
+# Find icpx (Intel DPC++/SYCL compiler) or open source LLVM clang++ compiler
+SYCLCC := $(shell which icpx 2>/dev/null)
+ifeq ($(notdir $(SYCLCC)),icpx)
+    $(info icpx compiler found at $(SYCLCC))
+else
+    $(info icpx not found. Searching for clang++.)
+    SYCLCC := $(shell which clang++ 2>/dev/null)
+    ifeq ($(SYCLCC),)
+        $(error clang++ not found either.)
+    else
+        $(info clang++ found at: $(SYCLCC))
+    endif
+endif
+# SYCL flags
+ifneq ($(DEBUG),yes)
+    SYCL_FLAGS = -O3
+else
+    SYCL_FLAGS = -g -O0
+endif
+SYCL_FLAGS += -fsycl -fno-sycl-id-queries-fit-in-int -std=c++17 -DLLMSYCL
+SYCL_LDFLAGS =
+SYCL_INCLUDES =
+SYCL_LDLIBS = -lsycl -lOpenCL
+ifeq ($(notdir $(SYCLCC)),icpx)
+    SYCL_FLAGS += -xhost -qopenmp -qopenmp-simd -DOMP -fp-model=precise
+    SYCL_LDLIBS = -liomp5
+else ifeq ($(notdir $(SYCLCC)),clang++)
+    SYCL_FLAGS += -march=native -ffp-model=precise
+    # Unfortunately clang doesn't seem to have OpenMP out-of-the-box
+    # and must be built/installed manually AFAIK
+    #SYCL_FLAGS += -fopenmp=libomp -fopenmp-simd -DOMP
+endif
+ifneq ($(TIME_PROFILE),)
+    SYCL_FLAGS += -DTIMEPROFILE=$(TIME_PROFILE)
+endif
+ifneq ($(DEVICE),gpu)
+    SYCL_LDLIBS += -ltbb
+endif
+ifeq ($(DEVICE),cpu)
+    SYCL_FLAGS += -DSYCL_CPU
+else ifeq ($(DEVICE_VENDOR),nvidia)
+    SYCL_FLAGS += -DSYCL_CUDA
+else
+	# No flag added for other GPUs for now
+endif
+
+# Ahead-of-time compilation flags, if possible
+ifeq ($(SYCL_AOT_COMPILE),pvc)
+    SYCL_FLAGS += -fsycl-targets=spir64_gen -Xs "-device pvc"
+endif
+ifeq ($(SYCL_AOT_COMPILE),a100)
+    SYCL_FLAGS += -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_80
+endif
+ifeq ($(SYCL_AOT_COMPILE),h100)
+    SYCL_FLAGS += -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90
+endif
 
 # We will place .o files in the `build` directory (create it if it doesn't exist)
 BUILD_DIR = build
@@ -183,12 +241,23 @@ else
       endif
     else
       # Check for OpenMP support in GCC or Clang on Linux
-      ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
-        CFLAGS += -fopenmp -DOMP
-        LDLIBS += -lgomp
-        $(info ✓ OpenMP found)
+      ifeq ($(SYCLCC),)
+        ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+          CFLAGS += -fopenmp -DOMP
+          LDLIBS += -lgomp
+          $(info ✓ OpenMP found)
+        else
+          $(info ✗ OpenMP not found)
+        endif
       else
-        $(info ✗ OpenMP not found)
+	      # Check for OpenMP support in Intel ICX/SYCL compiler on Linux
+        ifeq ($(shell echo | $(SYCLCC) -qopenmp -qopenmp-simd -x c -E - > /dev/null 2>&1; echo $$?), 0)
+          SYCL_FLAGS += -qopenmp -qopenmp-simd -DOMP
+          SYCL_LDLIBS += -liomp5
+          $(info ✓ Intel OpenMP found)
+        else
+          $(info ✗ Intel OpenMP not found)
+        endif
       endif
     endif
   endif
@@ -244,7 +313,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 train_gpt2sycl test_gpt2sycl train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
@@ -255,6 +324,12 @@ ifeq ($(NVCC),)
 else
     $(info ✓ nvcc found, including GPU/CUDA support)
     TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
+endif
+ifeq ($(SYCLCC),)
+    $(info ✗ icpx/clang++ not found, skipping GPU/SYCL builds)
+else
+    $(info ✓ $(notdir $(SYCLCC)) found, adding GPU/SYCL builds)
+    TARGETS += train_gpt2sycl test_gpt2sycl
 endif
 
 $(info ---------------------------------------------)
@@ -284,6 +359,12 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
+
+train_gpt2sycl: train_gpt2.sycl.cpp
+	$(SYCLCC) $(SYCL_FLAGS) $(SYCL_INCLUDES) $(SYCL_LDFLAGS) $^ $(SYCL_LDLIBS) $(SYCL_OUTPUT_FILE)
+
+test_gpt2sycl: test_gpt2.sycl.cpp
+	$(SYCLCC) $(SYCL_FLAGS) $(SYCL_INCLUDES) $(SYCL_LDFLAGS) $^ $(SYCL_LDLIBS) $(SYCL_OUTPUT_FILE)
 
 clean:
 	$(REMOVE_FILES) $(TARGETS)
