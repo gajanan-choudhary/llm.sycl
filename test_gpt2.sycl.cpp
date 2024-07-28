@@ -10,7 +10,7 @@ int check_tensor(float *a, float *b, int n, const char* label) {
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
         // look at the diffence at position i of these two tensors
-        float diff = fabsf(a[i] - b[i]);
+        float diff = FABS(a[i] - b[i]);
 
         // keep track of the overall error
         ok = ok && (diff <= tol);
@@ -38,9 +38,26 @@ int check_tensor(float *a, float *b, int n, const char* label) {
 
 int main(int argc, char *argv[]) {
 
+    // Catch asynchronous exceptions
+    auto exception_handler = [](sycl::exception_list exceptions) {
+        for (std::exception_ptr const &e : exceptions) {
+            try {
+                std::rethrow_exception(e);
+            }
+            catch (sycl::exception const &e) {
+                std::cout << "Caught an asynchronous SYCL exception:\n"
+                          << e.what() << std::endl;
+            }
+        }
+    };
+
+    //sycl::device dev(sycl::gpu_selector_v);
+    sycl::device dev;
+    sycl::queue queue(dev, exception_handler);
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(queue, &model, "gpt2_124M.bin");
 
     int C = model.config.channels;
     int V = model.config.vocab_size;
@@ -66,7 +83,7 @@ int main(int argc, char *argv[]) {
     printf("seq_len: %d\n", T);
 
     ParameterTensors expected_grads;
-    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_sizes);
+    float* expected_grads_memory = malloc_and_point_parameters(queue, &expected_grads, model.param_sizes);
 
     // inputs and expected outputs, only used for error checking
     int* x = (int*) malloc(B * T * sizeof(int));
@@ -87,25 +104,27 @@ int main(int argc, char *argv[]) {
 
     // let's do 10 training iterations, following the pytorch code
     float expected_losses[10] = {
-        5.270007133483887f,
-        4.059706687927246f,
-        3.3751230239868164f,
-        2.8007826805114746f,
-        2.315382242202759f,
-        1.8490285873413086f,
-        1.3946564197540283f,
-        0.9991465210914612f,
-        0.6240804195404053f,
-        0.37651097774505615f
+        5.270007133483887,
+        4.059706687927246,
+        3.3751230239868164,
+        2.8007826805114746,
+        2.315382242202759,
+        1.8490285873413086,
+        1.3946564197540283,
+        0.9991465210914612,
+        0.6240804195404053,
+        0.37651097774505615
     };
+    sycl::event last = sycl::event();
+    float *calculated_logits = (float *)hostMallocCheck(B * T * Vp * sizeof(float), queue);
     for (int step = 0; step < 10; step++) {
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        gpt2_forward(&model, x, y, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        last = gpt2_forward(queue, &model, x, y, B, T, {last});
+        last = gpt2_zero_grad(queue, &model, {last});
+        last = gpt2_backward(queue, &model, {last});
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -114,7 +133,8 @@ int main(int argc, char *argv[]) {
             // error checking at step 0 for reference activations/gradients
             // at this point, target should be equal to expected_logits, let's compare
             int logits_ok = 1;
-            float* calculated_logits = model.acts.logits;
+            last = queue.memcpy(calculated_logits, model.acts.logits, B * T * Vp * sizeof(float), {last});
+            last.wait();
             float max_diff = 0.0f;
             for (int bt = 0; bt < B*T; bt++) {
                 for (int v = 0; v < V; v++) { // note we only loop to V (ignoring padding)
@@ -122,7 +142,7 @@ int main(int argc, char *argv[]) {
                     if (i < 10) {
                         printf("%f, %f\n", expected_logits[i], calculated_logits[i]);
                     }
-                    float diff = fabsf(expected_logits[bt*V + v] - calculated_logits[i]);
+                    float diff = FABS(expected_logits[bt*V + v] - calculated_logits[i]);
                     max_diff = fmaxf(max_diff, diff);
                     if (diff >= 1e-2f) {
                         printf("MISMATCH AT INDEX %d,%d: ", bt, v);
@@ -138,7 +158,7 @@ int main(int argc, char *argv[]) {
             allok = allok && logits_ok;
 
             // compare the achieved loss
-            if (fabsf(model.mean_loss - *expected_loss) >= 1e-2) {
+            if (FABS(model.mean_loss - *expected_loss) >= 1e-2) {
                 printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
                 allok = 0;
             } else {
@@ -169,12 +189,12 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
+        last = gpt2_update(queue, &model, 1e-4, 0.9, 0.999, 1e-8, 0.01, step+1, {last});
 
         // compare the losses
         float expected_loss = expected_losses[step];
         float actual_loss = model.mean_loss;
-        int step_loss_ok = fabsf(expected_loss - actual_loss) < 1e-2;
+        int step_loss_ok = FABS(expected_loss - actual_loss) < 1e-2;
         allok = allok && step_loss_ok;
 
         // print the timing information at the end
@@ -184,12 +204,16 @@ int main(int argc, char *argv[]) {
     // final judgement
     printf("overall okay: %d\n", allok);
 
+    last.wait_and_throw();
+    queue.wait_and_throw();
+
     // free everything
     free(x);
     free(y);
     free(expected_logits);
     free(expected_loss);
-    free(expected_grads_memory);
-    gpt2_free(&model);
+    sycl::free(expected_grads_memory, queue);
+    sycl::free(calculated_logits, queue);
+    gpt2_free(queue, &model, {last});
     return 0;
 }

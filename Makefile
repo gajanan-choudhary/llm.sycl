@@ -58,9 +58,6 @@ else ifeq ($(notdir $(SYCLCC)),clang++)
     # and must be built/installed manually AFAIK
     #SYCL_FLAGS += -fopenmp=libomp -fopenmp-simd -DOMP
 endif
-ifneq ($(TIME_PROFILE),)
-    SYCL_FLAGS += -DTIMEPROFILE=$(TIME_PROFILE)
-endif
 ifneq ($(DEVICE),gpu)
     SYCL_LDLIBS += -ltbb
 endif

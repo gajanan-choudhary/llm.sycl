@@ -156,6 +156,35 @@ extern inline void *malloc_check(size_t size, const char *file, int line) {
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
 
+#ifdef LLMSYCL
+// ----------------------------------------------------------------------------
+// sycl::malloc_host/malloc_shared/malloc_device error-handling wrapper util
+
+extern inline void *sycl_malloc_check(size_t size, sycl::queue &queue, sycl::usm::alloc alloc_type, const char *file, int line) {
+    void *ptr;
+    if (alloc_type == sycl::usm::alloc::device)  ptr = malloc_device(size, queue);
+    else if (alloc_type == sycl::usm::alloc::shared)  ptr = malloc_shared(size, queue);
+    else if (alloc_type == sycl::usm::alloc::host)    ptr = malloc_host(size, queue);
+    else {
+        fprintf(stderr, "  Unexpected SYCL memory allocation type requested\n");
+        exit(EXIT_FAILURE);
+    }
+    if (ptr == NULL) {
+        fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Size: %zu bytes\n", size);
+        exit(EXIT_FAILURE);
+    }
+    return ptr;
+}
+
+#define deviceMallocCheck(size, queue) sycl_malloc_check(size, queue, sycl::usm::alloc::device, __FILE__, __LINE__)
+#define sharedMallocCheck(size, queue) sycl_malloc_check(size, queue, sycl::usm::alloc::shared, __FILE__, __LINE__)
+#define hostMallocCheck(size, queue)   sycl_malloc_check(size, queue, sycl::usm::alloc::host, __FILE__, __LINE__)
+#endif // #ifdef LLMSYCL
+
 // ----------------------------------------------------------------------------
 // check that all tokens are within range
 extern inline void token_check(const int* tokens, int token_count, int vocab_size, const char *file, int line) {
