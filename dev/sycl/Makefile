@@ -67,7 +67,8 @@ endif
 	$(SYCLCC) $(SYCL_FLAGS) $(SYCL_INCLUDES) $(SYCL_LDFLAGS) $^ $(SYCL_LDLIBS) -o $@
 
 # Build all targets
-TARGETS = matmul_forward matmul_backward
+TARGETS = matmul_forward matmul_backward \
+          layernorm_forward layernorm_backward
 
 all: $(TARGETS)
 
