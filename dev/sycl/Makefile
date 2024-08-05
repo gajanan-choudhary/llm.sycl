@@ -68,7 +68,8 @@ endif
 
 # Build all targets
 TARGETS = matmul_forward matmul_backward \
-          layernorm_forward layernorm_backward
+          layernorm_forward layernorm_backward \
+          attention_forward attention_backward
 
 all: $(TARGETS)
 
