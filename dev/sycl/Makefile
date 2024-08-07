@@ -70,7 +70,8 @@ endif
 TARGETS = matmul_forward matmul_backward \
           layernorm_forward layernorm_backward \
           attention_forward attention_backward \
-          encoder_forward encoder_backward
+          encoder_forward encoder_backward \
+          gelu_forward gelu_backward
 
 all: $(TARGETS)
 
