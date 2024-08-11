@@ -215,9 +215,11 @@ sycl::event crossentropy_softmax_backward(int kernel_num,
             if (sg_size == 32) {
                 return crossentropy_softmax_backward3<32>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg);
             }
+#ifndef _DISABLE_SG_SIZE_16
             else if (sg_size == 16) {
                 return crossentropy_softmax_backward3<16>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg);
             }
+#endif
 #ifndef _DISABLE_SG_SIZE_8
             else if (sg_size == 8) {
                 return crossentropy_softmax_backward3< 8>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg);

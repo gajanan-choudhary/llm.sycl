@@ -330,9 +330,11 @@ sycl::event softmax_forward(int kernel_num,
             if (sg_size == 32) {
                 return online_softmax_forward2<32>(queue, probs, logits, B, T, V, Vp, sg_per_wg);
             }
+#ifndef _DISABLE_SG_SIZE_16
             else if (sg_size == 16) {
                 return online_softmax_forward2<16>(queue, probs, logits, B, T, V, Vp, sg_per_wg);
             }
+#endif
 #ifndef _DISABLE_SG_SIZE_8
             else if (sg_size == 8) {
                 return online_softmax_forward2< 8>(queue, probs, logits, B, T, V, Vp, sg_per_wg);

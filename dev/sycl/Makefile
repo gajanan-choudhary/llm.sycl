@@ -73,7 +73,8 @@ TARGETS = matmul_forward matmul_backward \
           encoder_forward encoder_backward \
           gelu_forward gelu_backward \
           softmax_forward crossentropy_forward crossentropy_softmax_backward \
-          residual_forward residual_backward
+          residual_forward residual_backward \
+          adamw
 
 all: $(TARGETS)
 

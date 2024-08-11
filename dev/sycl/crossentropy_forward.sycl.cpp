@@ -133,9 +133,11 @@ sycl::event crossentropy_forward(int kernel_num,
             if (sg_size == 32) {
                 return crossentropy_forward2<32>(queue, losses, probs, targets, B, T, Vp, sg_per_wg);
             }
+#ifndef _DISABLE_SG_SIZE_16
             else if (sg_size == 16) {
                 return crossentropy_forward2<16>(queue, losses, probs, targets, B, T, Vp, sg_per_wg);
             }
+#endif
 #ifndef _DISABLE_SG_SIZE_8
             else if (sg_size == 8) {
                 return crossentropy_forward2< 8>(queue, losses, probs, targets, B, T, Vp, sg_per_wg);
