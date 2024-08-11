@@ -42,27 +42,13 @@ the GPT-2 model. This is a SYCL port meant to be accelerator-agnostic to
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+#ifdef TESTING
+// Due to the nature of validation in test_gpt2.sycl.cpp, we currently
+// need shared allocation when testing
 #define xxxMallocCheck sharedMallocCheck
-
-#define PARALLEL_ENC_FWD
-#define PARALLEL_LAYERNORM_FWD
-#define PARALLEL_ATTN_FWD
-#define PARALLEL_GELU_FWD
-#define PARALLEL_SOFTMAX_FWD // seems to cause the output to differ
-#define PARALLEL_CROSSENTROPY_FWD
-#define PARALLEL_MATMUL_FWD
-#define PARALLEL_RESID_FWD // Appears okay
-
-#define PARALLEL_ENC_BWD
-#define PARALLEL_LAYERNORM_BWD
-#define PARALLEL_ATTN_BWD
-#define PARALLEL_GELU_BWD
-#define PARALLEL_SOFTMAX_CROSSENTROPY_BWD
-#define PARALLEL_MATMUL_BWD
-#define PARALLEL_RESID_BWD // Appears okay
-
-#define PARALLEL_GPT2_LOSS_FWD
-#define PARALLEL_GPT2_UPDATE
+#else
+#define xxxMallocCheck deviceMallocCheck
+#endif
 
 // Helper for collecting timing info in milliseconds
 inline double get_elapsed_ms(struct timespec &start, struct timespec &end) {
@@ -73,94 +59,192 @@ inline double get_elapsed_ms(struct timespec &start, struct timespec &end) {
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
+template <int SG_SIZE>
+class ker_encoder_forward_2;
+
+template<int SG_SIZE>
+sycl::event encoder_forward2(sycl::queue &queue, float* out,
+                             const int* inp, const float* wte, const float* wpe,
+                             const int B, const int T, const int C, const int sg_per_wg,
+                             const std::vector<sycl::event> &dependencies = {}) {
+    const int wg_size = sg_per_wg * SG_SIZE;
+    const int ceilC = (C + wg_size - 1) & (-wg_size);
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t b = item.get_global_id(0);
+            const size_t t = item.get_global_id(1);
+            const size_t c = item.get_global_id(2);
+            const size_t bt = b*T+t;
+
+            if (c >= C) return;
+
+            // seek to the output position in out[b,t,:]
+            float* out_bt = out + bt * C;
+            // get the index of the token at inp[b, t]
+            const int ix = inp[bt];
+            // seek to the position in wte corresponding to the token
+            const float* wte_ix = wte + ix * C;
+            // seek to the position in wpe corresponding to the position
+            const float* wpe_t = wpe + t * C;
+            // add the two vectors and store the result in out[b,t,:]
+            out_bt[c] = wte_ix[c] + wpe_t[c];
+        };
+        cgh.parallel_for<class ker_encoder_forward_2<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(B, T, ceilC),
+                                  sycl::range<3>(1, 1, wg_size)), kernel);
+    });
+    return last;
+}
+
 sycl::event encoder_forward(sycl::queue &queue, float* out,
                             const int* inp, const float* wte, const float* wpe,
                             const int B, const int T, const int C,
                             const std::vector<sycl::event> &dependencies = {}) {
-    // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
-    // inp is (B,T) of integers, holding the token ids at each (b,t) position
-    // wte is (V,C) of token embeddings, short for "weight token embeddings"
-    // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 32;
+    return encoder_forward2<32>(queue, out, inp, wte, wpe, B, T, C, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 8;
+    return encoder_forward2<32>(queue, out, inp, wte, wpe, B, T, C, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 8;
+    return encoder_forward2<32>(queue, out, inp, wte, wpe, B, T, C, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_encoder_backward_3_dwte;
+
+template <int SG_SIZE>
+class ker_encoder_backward_3_dwpe;
+
+template<int SG_SIZE>
+sycl::event encoder_backward3(sycl::queue &queue, float* dwte, float* dwpe,
+                              const float* dout, const int* inp,
+                              const int B, const int T, const int C, const int sg_per_wg,
+                              const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((B + SG_SIZE - 1)/SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const size_t TC = T * C;
+    sycl::event ev_dwpe = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_ENC_FWD
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t t   = item.get_global_id(0);
+            const size_t c   = item.get_global_id(1);
+            const size_t tc  = t * C + c;
+            const size_t lid = item.get_local_id(2);
+            sycl::group gr   = item.get_group();
+
+            const float *dout_tc = dout + tc;
+            float val = 0.0f;
+            for (size_t b = lid; b < B; b += wg_size) {
+                val += dout_tc[b * TC];
+            }
+            val = sycl::reduce_over_group(gr, val, sycl::plus<float>());
+            if (lid == 0) dwpe[tc] += val;
+        };
+        // 2D nd_range (T*C instead of T,C) is slightly faster, but unfortunately
+        // does not work on A100 for some reason while 3D nd_range works.
+        cgh.parallel_for<class ker_encoder_backward_3_dwpe<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(T, C, wg_size),
+                                  sycl::range<3>(1, 1, wg_size)), kernel);
+    });
+
+    // Caution: using atomics in this kernel affects bit-wise reproducibility
+    // of the output. If bit-wise reproducibility is needed, we must use kernel
+    // 2 instead.
+    sycl::event ev_dwte = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
         auto kernel = [=](sycl::item<3> item) {
             const size_t b = item.get_id(0);
             const size_t t = item.get_id(1);
             const size_t c = item.get_id(2);
-            const size_t bt = b*T+t;
-#else
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-#endif
-                    // seek to the output position in out[b,t,:]
-                    float* out_bt = out + bt * C;
-                    // get the index of the token at inp[b, t]
-                    const int ix = inp[bt];
-                    // seek to the position in wte corresponding to the token
-                    const float* wte_ix = wte + ix * C;
-                    // seek to the position in wpe corresponding to the position
-                    const float* wpe_t = wpe + t * C;
-                    // add the two vectors and store the result in out[b,t,:]
-#ifdef PARALLEL_ENC_FWD
-                    out_bt[c] = wte_ix[c] + wpe_t[c];
+            const size_t bt = b * T + t;
+            const int ix = inp[bt];
+            float* dwte_ix = dwte + ix * C;
+            const float* dout_bt = dout + bt * C;
+            const float d = dout_bt[c];
+            sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space> dwte_atomic(dwte_ix[c]);
+            dwte_atomic.fetch_add(d);
         };
-        cgh.parallel_for<class ker_encoder_forward_1>(sycl::range<3>(B, T, C), kernel);
-#else
-                    for (int c = 0; c < C; c++) out_bt[c] = wte_ix[c] + wpe_t[c];
-                }
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_encoder_backward_3_dwte<SG_SIZE>>(sycl::range<3>(B, T, C), kernel);
     });
-    return last;
+
+    return queue.ext_oneapi_submit_barrier({ev_dwpe, ev_dwte});
 }
 
 sycl::event encoder_backward(sycl::queue &queue, float* dwte, float* dwpe,
                              const float* dout, const int* inp,
                              const int B, const int T, const int C,
                              const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 2;
+    return encoder_backward3<16>(queue, dwte, dwpe, dout, inp, B, T, C, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 1; // 2 gives HW-specific runtime errors in this case
+    return encoder_backward3<32>(queue, dwte, dwpe, dout, inp, B, T, C, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 2;
+    return encoder_backward3<32>(queue, dwte, dwpe, dout, inp, B, T, C, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_layernorm_forward_2;
+
+template<int SG_SIZE>
+sycl::event layernorm_forward2(sycl::queue &queue, float* out, float* mean, float* rstd,
+                               const float* inp, const float* weight, const float* bias,
+                               const int B, const int T, const int C, int sg_per_wg,
+                               const std::vector<sycl::event> &dependencies = {}) {
+    const float eps = 1e-5f;
+    const int wg_size = sg_per_wg * SG_SIZE;
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_ENC_BWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t c = item.get_id(0);
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b * T + t;
-                    const int ix = inp[bt];
-                    float* dwte_ix = dwte + ix * C;
-                    float* dwpe_t = dwpe + t * C;
-                    const float* dout_bt = dout + bt * C;
-                    const float d = dout_bt[c];
-                    dwte_ix[c] += d;
-                    dwpe_t[c] += d;
-                }
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt           = item.get_global_id(0);
+            const sycl::group gr      = item.get_group();
+            //const sycl::sub_group sgr = item.get_sub_group();
+            //const size_t sg_group_id  = sgr.get_group_id();
+            //const size_t sgr_cid      = sgr.get_local_id();
+            const size_t lid          = item.get_local_linear_id(); //sg_group_id * SG_SIZE + sgr_cid;
+
+            // seek to the input position inp[b,t,:]
+            const float* x = inp + bt * C;
+            // calculate the mean
+            float m = 0.0f;
+            for (int i = lid; i < C; i += wg_size) {
+                m += x[i];
             }
-        };
-        cgh.parallel_for<class ker_encoder_backward_1>(sycl::range<1>(C), kernel);
-#else
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-                    const float* dout_bt = dout + bt * C;
-                    const int ix = inp[bt];
-                    float* dwte_ix = dwte + ix * C;
-                    float* dwpe_t = dwpe + t * C;
-                    for (int c = 0; c < C; c++) {
-                        const float d = dout_bt[c];
-                        dwte_ix[c] += d;
-                        dwpe_t[c] += d;
-                    }
-                }
+            m = sycl::reduce_over_group(gr, m, sycl::plus<float>());
+            m = m/C;
+            // calculate the variance (without any bias correction)
+            float v = 0.0f;
+            for (int i = lid; i < C; i += wg_size) {
+                float xshift = x[i] - m;
+                v += xshift * xshift;
             }
+            v = sycl::reduce_over_group(gr, v, sycl::plus<float>());
+            v = v/C;
+            // calculate the rstd (reciprocal standard deviation)
+            float s = 1.0f / SQRT(v + eps);
+            // seek to the output position in out[b,t,:]
+            float* out_bt = out + bt * C;
+            for (int i = lid; i < C; i += wg_size) {
+                float n = (s * (x[i] - m)); // normalize
+                float o = n * weight[i] + bias[i]; // scale and shift
+                out_bt[i] = o; // write
+            }
+            // cache the mean and rstd for the backward pass later
+            mean[bt] = m;
+            rstd[bt] = s;
         };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_layernorm_forward_2<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(B*T, wg_size),
+                                  sycl::range<2>(1, wg_size)), kernel);
     });
     return last;
 }
@@ -169,124 +253,95 @@ sycl::event layernorm_forward(sycl::queue &queue, float* out, float* mean, float
                               const float* inp, const float* weight, const float* bias,
                               const int B, const int T, const int C,
                               const std::vector<sycl::event> &dependencies = {}) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
-    // both inp and out are (B,T,C) of the activations
-    // mean and rstd are (B,T) buffers, to be used later in backward pass
-    // at each position (b,t) of the input, the C-dimensional vector
-    // of activations gets normalized, then scaled and shifted
-    // Isn't eps = 1e-5 a problem if the variance is itself that
-    // small or smaller?
-    const float eps = 1e-5f;
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-#ifdef PARALLEL_LAYERNORM_FWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t bt = item.get_id(0);
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 2;
+    return layernorm_forward2<16>(queue, out, mean, rstd, inp, weight, bias, B, T, C, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 4;
+    return layernorm_forward2<32>(queue, out, mean, rstd, inp, weight, bias, B, T, C, sg_per_wg, dependencies);
 #else
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
+    constexpr int sg_per_wg = 4;
+    return layernorm_forward2<32>(queue, out, mean, rstd, inp, weight, bias, B, T, C, sg_per_wg, dependencies);
 #endif
-                    // seek to the input position inp[b,t,:]
-                    const float* x = inp + bt * C;
-                    // calculate the mean
-                    float m = 0.0f;
-                    for (int i = 0; i < C; i++) {
-                        m += x[i];
-                    }
-                    m = m/C;
-                    // calculate the variance (without any bias correction)
-                    float v = 0.0f;
-                    for (int i = 0; i < C; i++) {
-                        float xshift = x[i] - m;
-                        v += xshift * xshift;
-                    }
-                    v = v/C;
-                    // calculate the rstd (reciprocal standard deviation)
-                    float s = 1.0f / SQRT(v + eps);
-                    // seek to the output position in out[b,t,:]
-                    float* out_bt = out + bt * C;
-                    for (int i = 0; i < C; i++) {
-                        float n = (s * (x[i] - m)); // normalize
-                        float o = n * weight[i] + bias[i]; // scale and shift
-                        out_bt[i] = o; // write
-                    }
-                    // cache the mean and rstd for the backward pass later
-                    mean[bt] = m;
-                    rstd[bt] = s;
-#ifdef PARALLEL_LAYERNORM_FWD
-        };
-        cgh.parallel_for<class ker_layernorm_forward_1>(sycl::range<1>(B*T), kernel);
-#else
-                }
-            }
-        };
-        cgh.host_task(kernel);
-#endif
-    });
-    return last;
 }
 
-sycl::event layernorm_backward(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
-                               float* dout, float* inp, float* weight, float* mean, float* rstd,
-                               const int B, const int T, const int C, const std::vector<sycl::event> &dependencies = {}) {
-#ifdef PARALLEL_LAYERNORM_BWD
+template <int SG_SIZE>
+class ker_layernorm_backward_2_dbias_dweight;
+template <int SG_SIZE>
+class ker_layernorm_backward_2_dinp;
+
+template<int SG_SIZE>
+sycl::event layernorm_backward2(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                                const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
+                                const int B, const int T, const int C, const int sg_per_wg,
+                                const std::vector<sycl::event> &dependencies = {}) {
+    const int wg_size = sg_per_wg * SG_SIZE;
     sycl::event ev_dbias_dweight = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t c = item.get_id(0);
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t c            = item.get_global_id(0);
+            const sycl::group gr      = item.get_group();
+            const sycl::sub_group sgr = item.get_sub_group();
+            const size_t lid          = item.get_local_linear_id();
+
             const float *inp_c  = inp + c;
             const float *dout_c = dout + c;
 
-            float dbiasval = float(0);
-            float dweightval = float(0);
-            for (int bt = 0; bt < B*T; bt++) {
+            float dbiasval = 0.0f;
+            float dweightval = 0.0f;
+            for (int bt = lid; bt < B*T; bt += wg_size) {
                 const float d        = dout_c[bt * C];
                 const float norm_bti = (inp_c[bt * C] - mean[bt]) * rstd[bt];
                 // gather'd reduction
                 dbiasval   += d;
                 dweightval += norm_bti * d;
             }
+            dbiasval   = sycl::reduce_over_group(gr, dbiasval, sycl::plus<float>());
+            dweightval = sycl::reduce_over_group(gr, dweightval, sycl::plus<float>());
             // gradient contribution to bias
-            dbias[c] += dbiasval;
+            if (lid == 0) dbias[c] += dbiasval;
             // gradient contribution to weight
-            dweight[c] += dweightval;
+            if (lid == 0) dweight[c] += dweightval;
         };
-        cgh.parallel_for<class ker_layernorm_backward_1_dbias_dweight>(sycl::range<1>(C), kernel);
+        cgh.parallel_for<class ker_layernorm_backward_2_dbias_dweight<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(C, wg_size),
+                                  sycl::range<2>(1, wg_size)), kernel);
     });
 
     sycl::event ev_dinp = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t bt = item.get_id(0);
-            const size_t offset = bt * C;
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt           = item.get_global_id(0);
+            const sycl::group gr      = item.get_group();
+            const sycl::sub_group sgr = item.get_sub_group();
+            const size_t lid          = item.get_local_linear_id();
 
-            const float* dout_bt = dout + offset;
-            const float* inp_bt  = inp  + offset;
-            float* dinp_bt       = dinp + offset;
-
+            const float* dout_bt = dout + bt * C;
+            const float* inp_bt = inp + bt * C;
+            float* dinp_bt = dinp + bt * C;
             const float mean_bt = mean[bt];
             const float rstd_bt = rstd[bt];
 
             // first: two reduce operations
-            float dnorm_mean = float(0);
-            float dnorm_norm_mean = float(0);
-            for (int i = 0; i < C; i++) {
+            float dnorm_mean = 0.0f;
+            float dnorm_norm_mean = 0.0f;
+            for (int i = lid; i < C; i += wg_size) {
                 const float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                const float dnorm_i  = weight[i] * dout_bt[i];
+                const float dnorm_i = weight[i] * dout_bt[i];
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
             }
-            dnorm_mean      = dnorm_mean / C;
+            dnorm_mean = sycl::reduce_over_group(gr, dnorm_mean, sycl::plus<float>());
+            dnorm_norm_mean = sycl::reduce_over_group(gr, dnorm_norm_mean, sycl::plus<float>());
+            dnorm_mean = dnorm_mean / C;
             dnorm_norm_mean = dnorm_norm_mean / C;
 
-            // now iterate again and accumulate the remaining gradient
-            for (int i = 0; i < C; i++) {
+            // now iterate again and accumulate all the gradients
+            for (int i = lid; i < C; i += wg_size) {
                 const float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                const float dnorm_i  = weight[i] * dout_bt[i];
+                const float dnorm_i = weight[i] * dout_bt[i];
                 // gradient contribution to input
-                float dval = float(0);
+                float dval = 0.0f;
                 dval += dnorm_i; // term 1
                 dval -= dnorm_mean; // term 2
                 dval -= norm_bti * dnorm_norm_mean; // term 3
@@ -294,95 +349,73 @@ sycl::event layernorm_backward(sycl::queue &queue, float* dinp, float* dweight, 
                 dinp_bt[i] += dval;
             }
         };
-        cgh.parallel_for<class ker_layernorm_backward_1_dinp>(sycl::range<1>(B*T), kernel);
+        cgh.parallel_for<class ker_layernorm_backward_2_dinp<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(B*T, wg_size),
+                                  sycl::range<2>(1, wg_size)), kernel);
     });
     return queue.ext_oneapi_submit_barrier({ev_dbias_dweight, ev_dinp});
+}
+
+sycl::event layernorm_backward(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                               float* dout, float* inp, float* weight, float* mean, float* rstd,
+                               const int B, const int T, const int C,
+                               const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 2;
+    return layernorm_backward2<16>(queue, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 8;
+    return layernorm_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, sg_per_wg, dependencies);
 #else
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-                    const float* dout_bt = dout + bt * C;
-                    const float* inp_bt = inp + bt * C;
-                    float* dinp_bt = dinp + bt * C;
-                    const float mean_bt = mean[bt];
-                    const float rstd_bt = rstd[bt];
-
-                    // first: two reduce operations
-                    float dnorm_mean = 0.0f;
-                    float dnorm_norm_mean = 0.0f;
-                    for (int i = 0; i < C; i++) {
-                        const float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                        const float dnorm_i = weight[i] * dout_bt[i];
-                        dnorm_mean += dnorm_i;
-                        dnorm_norm_mean += dnorm_i * norm_bti;
-                    }
-                    dnorm_mean = dnorm_mean / C;
-                    dnorm_norm_mean = dnorm_norm_mean / C;
-
-                    // now iterate again and accumulate all the gradients
-                    for (int i = 0; i < C; i++) {
-                        const float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                        const float dnorm_i = weight[i] * dout_bt[i];
-                        // gradient contribution to bias
-                        dbias[i] += dout_bt[i];
-                        // gradient contribution to weight
-                        dweight[i] += norm_bti * dout_bt[i];
-                        // gradient contribution to input
-                        float dval = 0.0f;
-                        dval += dnorm_i; // term 1
-                        dval -= dnorm_mean; // term 2
-                        dval -= norm_bti * dnorm_norm_mean; // term 3
-                        dval *= rstd_bt; // final scale
-                        dinp_bt[i] += dval;
-                    }
-                }
-            }
-        };
-        cgh.host_task(kernel);
-    });
-    return last;
+    constexpr int sg_per_wg = 8;
+    return layernorm_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, sg_per_wg, dependencies);
 #endif
 }
 
-sycl::event matmul_forward_naive(sycl::queue &queue, float* out,
+template <int SG_SIZE>
+class ker_matmul_forward2;
+
+template<int SG_SIZE>
+sycl::event matmul_forward2(sycl::queue &queue, float* out,
                                  const float* inp, const float* weight, const float* bias,
-                                 const int B, const int T, const int C, const int OC,
-                                 const std::vector<sycl::event> &dependencies = {}) {
-    // the most naive implementation of matrix multiplication
-    // this serves as an algorithmic reference, and as a fallback for
-    // unfriendly input shapes inside matmul_forward(), below.
+                                 int B, int T, int C, int OC, int sg_per_wg,
+                                 const std::vector<sycl::event> &dependencies = {})
+{
+    // Round up next multiple, sg_per_wg always assumed to be a power of 2
+    const int ceilBT = (B*T + sg_per_wg - 1) & (-sg_per_wg);
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_MATMUL_FWD
-        auto kernel = [=](sycl::item<2> item) {
-            const size_t bt = item.get_id(0);
-            const size_t o  = item.get_id(1);
-#else
-        auto kernel = [=]() {
-            #pragma omp parallel for collapse(2)
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const int bt = b*T+t;
-                    for (int o = 0; o < OC; o++) {
-#endif
-                        float val = (bias != NULL) ? bias[o] : 0.0f;
-                        for (int i = 0; i < C; i++) {
-                            val += inp[bt * C + i] * weight[o*C + i];
-                        }
-                        out[bt * OC + o] = val;
-#ifdef PARALLEL_MATMUL_FWD
-        };
-        cgh.parallel_for<class ker_matmul_forward_1>(sycl::range<2>(B*T, OC), kernel);
-#else
-                    }
-                }
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt            = item.get_global_id(0);
+            const size_t o             = item.get_global_id(1);
+            const sycl::sub_group sgr  = item.get_sub_group();
+            const std::uint8_t sgr_cid = sgr.get_local_id();
+
+            if (bt >= B*T) return;
+
+            const size_t inp_ind_start = bt * C;
+            const size_t wt_ind_start  = o * C;
+            const size_t out_ind_start = bt * OC;
+
+            float val = 0.0f;
+            // Split the following into optimzation below
+            for (size_t i = sgr_cid; i < C; i += SG_SIZE) {
+                val += inp[inp_ind_start + i] * weight[wt_ind_start + i];
+            }
+            // Reduce values in sub_group to lid == 0
+            //val = sycl::reduce_over_group(sgr, val, sycl::plus<float>());
+            for (std::uint8_t j = SG_SIZE >> 1; j > 0; j >>= 1) {
+                val += sycl::shift_group_left(sgr, val, j);
+            }
+
+            if (sgr_cid == 0) {
+                const float b = ((bias != NULL) ? bias[o] : 0.0f);
+                out[out_ind_start + o] = val + b;
             }
         };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_matmul_forward2<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(ceilBT, OC, SG_SIZE),
+                                  sycl::range<3>(sg_per_wg, 1, SG_SIZE)), kernel);
     });
     return last;
 }
@@ -399,10 +432,20 @@ sycl::event matmul_forward(sycl::queue &queue, float* out,
     // out will be (B,T,OC)
 
     // make sure the tiled loop will be correct or fallback to naive version
-    constexpr std::uint16_t LOOP_UNROLL = 8;
-    if (B*T % LOOP_UNROLL != 0) {
-        return matmul_forward_naive(queue, out, inp, weight, bias, B, T, C, OC, dependencies);
-    }
+    constexpr int LOOP_UNROLL = 8;
+    //if (B*T % LOOP_UNROLL != 0) {
+#if defined(SYCL_CPU)
+        // sg_size = 32 had bad performance on CPU device
+        constexpr int sg_per_wg = 4;
+        return matmul_forward2<16>(queue, out, inp, weight, bias, B, T, C, OC, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+        constexpr int sg_per_wg = 4;
+        return matmul_forward2<32>(queue, out, inp, weight, bias, B, T, C, OC, sg_per_wg, dependencies);
+#else
+        constexpr int sg_per_wg = 4;
+        return matmul_forward2<32>(queue, out, inp, weight, bias, B, T, C, OC, sg_per_wg, dependencies);
+#endif
+    //}
 
     // collapse the B and T loops into one and turn it into a strided loop.
     // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
@@ -479,48 +522,56 @@ sycl::event matmul_forward(sycl::queue &queue, float* out,
     return last;
 }
 
-sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
-                            const float* dout, const float* inp, const float* weight,
-                            const int B, const int T, const int C, const int OC,
-                            const std::vector<sycl::event> &dependencies = {}) {
-    // most of the running time is spent here and in matmul_forward
-    // this backward could be done in a single "round" of loops
-    // but that doesn't afford an efficient parallelization strategy
-#ifdef PARALLEL_MATMUL_BWD
-    // backward into dinp first, parallelize over B*T, C
-    // dinp depends on dout, weight
+template <int SG_SIZE>
+class ker_matmul_backward2_dinp;
+template <int SG_SIZE>
+class ker_matmul_backward2_dweight;
+template <int SG_SIZE>
+class ker_matmul_backward2_dbias;
+
+template<int SG_SIZE>
+sycl::event matmul_backward2(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                             const float* dout, const float* inp, const float* weight,
+                             int B, int T, int C, int OC, int sg_per_wg,
+                             const std::vector<sycl::event> &dependencies = {})
+{
+    // Round up next multiple, sg_per_wg always assumed to be a power of 2
+    const int ceilBT = (B*T + sg_per_wg - 1) & (-sg_per_wg);
+    const int ceilC  = (C + SG_SIZE - 1) & (-SG_SIZE);
     sycl::event ev_dinp = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<2> item) {
-            const size_t bt = item.get_id(0);
-            const size_t c = item.get_id(1);
-            const float* dout_bt = dout + bt * OC;
-            float* dinp_bt = dinp + bt * C;
-            float val = float(0);
-            for (int o = 0; o < OC; o++) {
-                const float* wrow = weight + o*C;
-                float d = dout_bt[o];
-                val += wrow[c] * d;
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt = item.get_global_id(0);
+            const size_t c  = item.get_global_id(1);
+            if (c >= C || bt >= B*T) return;
+            float val = 0.0f;
+            for (int o = 0; o < OC; ++o) {
+                val += weight[o * C + c] * dout[bt * OC + o];
             }
-            dinp_bt[c] += val;
+            dinp[bt * C + c] += val;
         };
-        cgh.parallel_for<class ker_matmul_backward1_dinp>(sycl::range<2>(B*T, C), kernel);
+        cgh.parallel_for<class ker_matmul_backward2_dinp<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(ceilBT, ceilC),
+                                  sycl::range<2>(sg_per_wg, SG_SIZE)), kernel);
     });
 
     // backward into weight, parallelize over output channels OC, C
+    const int ceilOC = (OC + sg_per_wg - 1) & (-sg_per_wg);
     sycl::event ev_dweight = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<2> item) {
-            const size_t o   = item.get_id(0);
-            const size_t c   = item.get_id(1);
-            const size_t lid = item.get_linear_id();
-            float val = float(0);
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t o = item.get_global_id(0);
+            const size_t c = item.get_global_id(1);
+            if (o >= OC || c >= C) return;
+            float val = 0.0f;
             for (int bt = 0; bt < B*T; bt++) {
                 val += inp[bt * C + c] * dout[bt * OC + o];
             }
-            dweight[lid] += val;
+            dweight[o * C + c] += val;
         };
-        cgh.parallel_for<class ker_matmul_backward1_dweight>(sycl::range<2>(OC, C), kernel);
+        cgh.parallel_for<class ker_matmul_backward2_dweight<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(ceilOC, ceilC),
+                                  sycl::range<2>(sg_per_wg, SG_SIZE)), kernel);
     });
 
     // backward into bias, parallelize over output channels OC
@@ -528,185 +579,195 @@ sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, flo
     if (dbias != NULL) {
         ev_dbias = queue.submit([&](sycl::handler &cgh) {
             cgh.depends_on(dependencies);
-            auto kernel = [=](sycl::item<1> item) {
-                const size_t o = item.get_id(0);
-                float sum = float(0);
-                for (int bt = 0; bt < B*T; bt++) {
-                    const float* dout_bt = dout + bt * OC;
-                    sum += dout_bt[o];
+            auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const size_t o            = item.get_global_id(0);
+                const sycl::sub_group sgr = item.get_sub_group();
+                const size_t sgr_cid      = sgr.get_local_id();
+                if (o >= OC) return;
+                float sum = 0.0f;
+                for (int bt = sgr_cid; bt < B*T; bt += SG_SIZE) {
+                    sum += dout[bt * OC + o];
                 }
-                dbias[o] += sum;
+                // Reduce values in each sub_group to sgr_cid == 0
+                sum = sycl::reduce_over_group(sgr, sum, sycl::plus<float>());
+                // For unknown reason, this reduction is failing on CPU device
+                //for (std::uint8_t j = SG_SIZE >> 1; j > 0; j >>= 1) {
+                //    sum += sycl::shift_group_left(sgr, sum, j);
+                //}
+                if (sgr_cid == 0) dbias[o] += sum;
             };
-            cgh.parallel_for<class ker_matmul_backward1_dbias>(sycl::range<1>(OC), kernel);
+            cgh.parallel_for<class ker_matmul_backward2_dbias<SG_SIZE>>(
+                    sycl::nd_range<2>(sycl::range<2>(ceilOC, SG_SIZE),
+                                      sycl::range<2>(sg_per_wg, SG_SIZE)), kernel);
         });
     }
-    return queue.ext_oneapi_submit_barrier({ev_dinp, ev_dweight, ev_dbias});
-#else
-    // backward into inp first, parallelize over B,T
-    sycl::event second_last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-        auto kernel = [=]() {
-            #pragma omp parallel for collapse(2)
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-                    const float* dout_bt = dout + bt * OC;
-                    float* dinp_bt = dinp + bt * C;
-                    for (int o = 0; o < OC; o++) {
-                        const float* wrow = weight + o*C;
-                        float d = dout_bt[o];
-                        for (int i = 0; i < C; i++) {
-                            dinp_bt[i] += wrow[i] * d;
-                        }
-                    }
-                }
-            }
-        };
-        cgh.host_task(kernel);
-    });
 
-    // backward into weight/bias, parallelize over output channels OC
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(second_last);
-        auto kernel = [=]() {
-            #pragma omp parallel for
-            for (int o = 0; o < OC; o++) {
-                for (int b = 0; b < B; b++) {
-                    for (int t = 0; t < T; t++) {
-                        const size_t bt = b*T+t;
-                        const float* dout_bt = dout + bt * OC;
-                        const float* inp_bt = inp + bt * C;
-                        float* dwrow = dweight + o*C;
-                        float d = dout_bt[o];
-                        if (dbias != NULL) { dbias[o] += d; }
-                        for (int i = 0; i < C; i++) {
-                            dwrow[i] += inp_bt[i] * d;
-                        }
-                    }
-                }
-            }
-        };
-        cgh.host_task(kernel);
-    });
-    return last;
+    return queue.ext_oneapi_submit_barrier({ev_dinp, ev_dweight, ev_dbias});
+}
+
+sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                            const float* dout, const float* inp, const float* weight,
+                            int B, int T, int C, int OC,
+                            const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    // sg_size = 32 had bad performance on CPU device
+    constexpr int sg_per_wg = 1;
+    return matmul_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, B, T, C, OC, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return matmul_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, B, T, C, OC, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return matmul_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, B, T, C, OC, sg_per_wg, dependencies);
 #endif
 }
 
-sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, float* att,
-                              float* inp,
-                              const int B, const int T, const int C, const int NH,
-                              const std::vector<sycl::event> &dependencies = {}) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // that holds the pre-attention and post-attention scores (used in backward)
-    // output is (B, T, C)
-    // attention is the only layer that mixes information across time
-    // every other operation is applied at every (b,t) position independently
-    // (and of course, no layer mixes information across batch)
+template <int SG_SIZE>
+class ker_attention_forward_2;
+
+template<int SG_SIZE>
+sycl::event attention_forward2(sycl::queue &queue, float* out, float* preatt, float* att,
+                               const float* inp,
+                               const int B, const int T, const int C, const int NH, const int sg_per_wg,
+                               const std::vector<sycl::event> &dependencies = {}) {
+    assert(C % NH == 0);
     const int C3 = C*3;
     const int hs = C / NH; // head size
     const float scale = 1.0 / SQRT(float(hs));
+    // Here we do something slightly different from usual, viz.,
+    // we disallow workgroup size to exceed `hs` by too much.
+    // It may exceed
+    //const int wg_size = sg_per_wg * SG_SIZE;
+    const int adjusted_sg_per_wg = std::min((hs + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
 
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_ATTN_FWD
-        auto kernel = [=](sycl::item<3> item) {
-            const size_t b = item.get_id(0);
-            const size_t t = item.get_id(1);
-            const size_t h = item.get_id(2);
-            const size_t bt = b*T+t;
-#else
-        auto kernel = [=]() {
-            #pragma omp parallel for collapse(3)
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-                    for (int h = 0; h < NH; h++) {
-#endif
-                        const float* query_t = inp + bt * C3 + h * hs;
-                        float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                        float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt     = item.get_global_id(0);
+            const size_t b      = bt / T;
+            const size_t t      = bt % T;
+            const size_t h      = item.get_global_id(1);
 
-                        // pass 1: calculate query dot key and maxval
-                        float maxval = -10000.0f; // TODO something better
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+            sycl::group gr      = item.get_group();
+            const size_t lid    = item.get_local_linear_id(); // sg_gid * SG_SIZE + sg_cid
 
-                            // (query_t) dot (key_t2)
-                            float val = 0.0f;
-                            for (int i = 0; i < hs; i++) {
-                                val += query_t[i] * key_t2[i];
-                            }
-                            val *= scale;
-                            if (val > maxval) {
-                                maxval = val;
-                            }
+            const size_t ht      = h * T + t;
+            const float* query_t = inp + bt * C3 + h * hs;
+            float* preatt_bth    = preatt + b * NH * T * T + ht * T;
+            float* att_bth       = att + b * NH * T * T + ht * T;
 
-                            preatt_bth[t2] = val;
-                        }
+            // pass 1: calculate query dot key and maxval
+            float maxval = -std::numeric_limits<float>::max();
+            const float* key_t2_base = inp + b * T * C3 + h * hs + C; // +C because it's key
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* key_t2 = key_t2_base + t2 * C3; // +C because it's key
 
-                        // pass 2: calculate the exp and keep track of sum
-                        // maxval is being calculated and subtracted only for numerical stability
-                        float expsum = 0.0f;
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            float expv = EXP(preatt_bth[t2] - maxval);
-                            expsum += expv;
-                            att_bth[t2] = expv;
-                        }
-                        float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+                // (query_t) dot (key_t2)
+                float val = 0.0f;
+                for (int i = lid; i < hs; i += wg_size) {
+                    val += query_t[i] * key_t2[i];
+                }
+                val = sycl::reduce_over_group(gr, val, sycl::plus<float>());
+                val *= scale;
+                if (val > maxval) {
+                    maxval = val;
+                }
 
-                        // pass 3: normalize to get the softmax
-                        for (int t2 = 0; t2 < T; t2++) {
-                            if (t2 <= t) {
-                                att_bth[t2] *= expsum_inv;
-                            } else {
-                                // causal attention mask. not strictly necessary to set to zero here
-                                // only doing this explicitly for debugging and checking to PyTorch
-                                att_bth[t2] = 0.0f;
-                            }
-                        }
+                if (lid == 0) preatt_bth[t2] = val;
+            }
+            sycl::group_barrier(gr);
 
-                        // pass 4: accumulate weighted values into the output of attention
-                        float* out_bth = out + bt * C + h * hs;
-                        for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                            float att_btht2 = att_bth[t2];
-                            for (int i = 0; i < hs; i++) {
-                                out_bth[i] += att_btht2 * value_t2[i];
-                            }
-                        }
-#ifdef PARALLEL_ATTN_FWD
-        };
-        cgh.parallel_for<class ker_attention_forward_1>(sycl::range<3>(B, T, NH), kernel);
-#else
-                    }
+            // pass 2: calculate the exp and keep track of sum
+            // maxval is being calculated and subtracted only for numerical stability
+            float expsum = 0.0f;
+            for (int t2 = lid; t2 <= t; t2 += wg_size) {
+                float expv = EXP(preatt_bth[t2] - maxval);
+                expsum += expv;
+                att_bth[t2] = expv;
+            }
+            expsum = sycl::reduce_over_group(gr, expsum, sycl::plus<float>());
+            float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+            // pass 3: normalize to get the softmax
+            for (int t2 = lid; t2 < T; t2 += wg_size) {
+                if (t2 <= t) {
+                    att_bth[t2] *= expsum_inv;
+                } else {
+                    // causal attention mask. not strictly necessary to set to zero here
+                    // only doing this explicitly for debugging and checking to PyTorch
+                    att_bth[t2] = 0.0f;
+                }
+            }
+
+            // pass 4: accumulate weighted values into the output of attention
+            float* out_bth = out + bt * C + h * hs;
+            for (int i = lid; i < hs; i += wg_size) { out_bth[i] = 0.0f; }
+            sycl::group_barrier(gr);
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                float att_btht2 = att_bth[t2];
+                for (int i = lid; i < hs; i += wg_size) {
+                    out_bth[i] += att_btht2 * value_t2[i];
                 }
             }
         };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_attention_forward_2<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(B * T, NH, wg_size),
+                                  sycl::range<3>(1, 1, wg_size)), kernel);
     });
     return last;
 }
 
-sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
-                               float* dout, float* inp, float* att,
-                               const int B, const int T, const int C, const int NH,
-                               const std::vector<sycl::event> &dependencies = {}) {
+sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, float* att,
+                              const float* inp,
+                              const int B, const int T, const int C, const int NH,
+                              const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    // sg_size = 32 had bad performance on CPU device
+    constexpr int sg_per_wg = 2;
+    return attention_forward2<16>(queue, out, preatt, att, inp, B, T, C, NH, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 2;
+    return attention_forward2<32>(queue, out, preatt, att, inp, B, T, C, NH, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 2;
+    return attention_forward2<32>(queue, out, preatt, att, inp, B, T, C, NH, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_attention_backward_3;
+
+template <typename T>
+using atomic_ref_relaxed = sycl::atomic_ref<T, sycl::memory_order::relaxed,
+                                            sycl::memory_scope::work_group,
+                                            sycl::access::address_space::global_space>;
+
+template<int SG_SIZE>
+sycl::event attention_backward3(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+                                const float* dout, const float* inp, const float* att,
+                                const int B, const int T, const int C, const int NH, const int sg_per_wg,
+                                const std::vector<sycl::event> &dependencies = {}) {
     // inp/dinp are (B, T, 3C) Q,K,V
     // att/datt/dpreatt are (B, NH, T, T)
     // dout is (B, T, C)
     const int C3 = C*3;
     const int hs = C / NH; // head size
     const float scale = 1.f / SQRT(float(hs));
-
-#ifdef PARALLEL_ATTN_BWD
+    const int adjusted_sg_per_wg = std::min((T + SG_SIZE - 1)/SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<2> item) {
-            const size_t b = item.get_id(0);
-            const size_t h = item.get_id(1);
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t b      = item.get_global_id(0);
+            const size_t h      = item.get_global_id(1);
+            const size_t lid    = item.get_local_linear_id();
+            sycl::group gr      = item.get_group();
+            sycl::sub_group sgr = item.get_sub_group();
+            const size_t sg_gid = sgr.get_group_id();
+            const size_t sg_cid = sgr.get_local_id();
+
             for (size_t t = 0; t < T; t++) {
                 const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
                 float* datt_bth = datt + b*NH*T*T + h*T*T + t*T; // easy parallel
@@ -716,137 +777,135 @@ sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, 
 
                 // backward pass 4, through the value accumulation
                 const float* dout_bth = dout + b * T * C + t * C + h * hs;
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (int t2 = sg_gid; t2 <= t; t2+= adjusted_sg_per_wg) {
+                    const float att_bth_t2 = att_bth[t2];
                     const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                     float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
-                    float datt_val = float(0);
-                    for (int i = 0; i < hs; i++) {
+                    float datt_val = 0.0f;
+                    for (int i = sg_cid; i < hs; i+=SG_SIZE) {
                         // in the forward pass this was:
                         // out_bth[i] += att_bth[t2] * value_t2[i];
                         // so now we have:
-                        datt_val     += value_t2[i] * dout_bth[i];
-                        dvalue_t2[i] += att_bth[t2] * dout_bth[i];
+                        const float dout_bth_i = dout_bth[i];
+                        atomic_ref_relaxed<float> dvalue_t2_atomic(dvalue_t2[i]);
+                        dvalue_t2_atomic.fetch_add(att_bth_t2 * dout_bth_i);
+                        datt_val += value_t2[i] * dout_bth_i;
+                        //datt_val     += value_t2[i] * dout_bth[i];
+                        //dvalue_t2[i] += att_bth[t2] * dout_bth[i];
                     }
-                    datt_bth[t2] += datt_val;
+                    //datt_bth[t2] += datt_val;
+                    datt_val = sycl::reduce_over_group(sgr, datt_val, sycl::plus<float>());
+                    if (sg_cid == 0) datt_bth[t2] += datt_val;
                 }
+                sycl::group_barrier(gr);
 
                 // backward pass 2 & 3, the softmax
                 // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                for (int t3 = 0; t3 <= t; t3++) {
-                    const float att_bth_t3 = att_bth[t3];
-                    float dpreatt_val = float(0);
-                    for (int t2 = 0; t2 <= t; t2++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
+                for (int t3 = sg_gid; t3 <= t; t3+=adjusted_sg_per_wg) {
+                    const float att_bth_t3  = att_bth[t3];
+                    float dpreatt_val = 0.0f;
+                    for (int t2 = sg_cid; t2 <= t; t2+=SG_SIZE) {
+                        const float indicator = t2 == t3 ? 1.0f : 0.0f;
+                        const float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
                         dpreatt_val += local_derivative * datt_bth[t2];
+                        //dpreatt_bth[t3] += local_derivative * datt_bth[t2];
                     }
-                    dpreatt_bth[t3] += dpreatt_val;
+                    dpreatt_val = sycl::reduce_over_group(sgr, dpreatt_val, sycl::plus<float>());
+                    if (sg_cid == 0) dpreatt_bth[t3] += dpreatt_val;
+                    //atomic_ref_relaxed<float> dpreatt_bth_atomic(dpreatt_bth[t3]);
+                    //dpreatt_bth_atomic.fetch_add(local_derivative * datt_bth[t2]);
                 }
+                sycl::group_barrier(gr);
 
                 // backward pass 1, the query @ key matmul
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (int t2 = sg_gid; t2 <= t; t2+=adjusted_sg_per_wg) {
                     const float scaled_dpreatt_t2 = dpreatt_bth[t2] * scale;
                     const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
                     float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = sg_cid; i < hs; i+=SG_SIZE) {
                         // in the forward pass this was:
                         // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
                         // so now we have:
-                        dquery_t[i] += key_t2[i] * scaled_dpreatt_t2;
-                        dkey_t2[i] += query_t[i] * scaled_dpreatt_t2;
+                        atomic_ref_relaxed<float> dquery_t_atomic(dquery_t[i]);
+                        atomic_ref_relaxed<float> dkey_t2_atomic(dkey_t2[i]);
+                        dquery_t_atomic.fetch_add(key_t2[i] * scaled_dpreatt_t2);
+                        dkey_t2_atomic.fetch_add(query_t[i] * scaled_dpreatt_t2);
+                        //dquery_t[i] += key_t2[i] * dpreatt_bth_t2 * scale;
+                        //dkey_t2[i] += query_t[i] * dpreatt_bth_t2 * scale;
                     }
                 }
+                sycl::group_barrier(gr);
             }
         };
-        cgh.parallel_for<class ker_attention_backward_1>(sycl::range<2>(B, NH), kernel);
+        cgh.parallel_for<class ker_attention_backward_3<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(B, NH, wg_size),
+                                  sycl::range<3>(1, 1, wg_size)), kernel);
     });
-#else
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-                    for (int h = 0; h < NH; h++) {
-                        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                        float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                        float* dquery_t = dinp + bt * C3 + h * hs;
-                        const float* query_t = inp + bt * C3 + h * hs;
-
-                        // backward pass 4, through the value accumulation
-                        const float* dout_bth = dout + bt * C + h * hs;
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                            float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
-                            for (int i = 0; i < hs; i++) {
-                                // in the forward pass this was:
-                                // out_bth[i] += att_bth[t2] * value_t2[i];
-                                // so now we have:
-                                datt_bth[t2] += value_t2[i] * dout_bth[i];
-                                dvalue_t2[i] += att_bth[t2] * dout_bth[i];
-                            }
-                        }
-
-                        // backward pass 2 & 3, the softmax
-                        // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            for (int t3 = 0; t3 <= t; t3++) {
-                                float indicator = t2 == t3 ? 1.0f : 0.0f;
-                                float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                                dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                            }
-                        }
-
-                        // backward pass 1, the query @ key matmul
-                        for (int t2 = 0; t2 <= t; t2++) {
-                            float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                            float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                            for (int i = 0; i < hs; i++) {
-                                // in the forward pass this was:
-                                // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                                // so now we have:
-                                dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
-                                dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        cgh.host_task(kernel);
-    });
-#endif
     return last;
+}
+
+sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+                               const float* dout, const float* inp, const float* att,
+                               const int B, const int T, const int C, const int NH,
+                               const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    // This particular attention_backward kernel is actually not too great on
+    // CPU device compared to some other kernels, but fantastic on GPU
+    constexpr int sg_per_wg = 4;
+    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
+#endif
 }
 
 #define GELU_SCALING_FACTOR SQRT(2.0f / M_PI)
-sycl::event gelu_forward(sycl::queue &queue, float* out, const float* inp,
-                         const int N, const std::vector<sycl::event> &dependencies = {}) {
-    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+template <int SG_SIZE>
+class ker_gelu_forward_2;
+
+template<int SG_SIZE>
+sycl::event gelu_forward2(sycl::queue &queue, float* out,
+                          const float* inp, const int N, const int sg_per_wg,
+                          const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const int ceilN = ((N + wg_size - 1) / wg_size) * wg_size;
+
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_GELU_FWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t i = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            for (int i = 0; i < N; i++) {
-#endif
-                float x = inp[i];
-                float cube = 0.044715f * x * x * x;
-                out[i] = 0.5f * x * (1.0f + TANH(GELU_SCALING_FACTOR * (x + cube)));
-#ifdef PARALLEL_GELU_FWD
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t i = item.get_global_id(0);
+            if (i >= N) return;
+            const float x = inp[i];
+            float cube = 0.044715f * x * x * x;
+            out[i] = 0.5f * x * (1.0f + TANH(GELU_SCALING_FACTOR * (x + cube)));
         };
-        cgh.parallel_for<class ker_gelu_forward_1>(sycl::range<1>(N), kernel);
-#else
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_gelu_forward_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
     });
     return last;
 }
+
+sycl::event gelu_forward(sycl::queue &queue, float* out,
+                         const float* inp, const int N,
+                         const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 128;
+    return gelu_forward2<16>(queue, out, inp, N, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 4;
+    return gelu_forward2<32>(queue, out, inp, N, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 4;
+    return gelu_forward2<32>(queue, out, inp, N, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_gelu_backward_2;
 
 // TBD if the following is still needed; Warnings thrown with ICPX compiler
 //// we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
@@ -854,81 +913,183 @@ sycl::event gelu_forward(sycl::queue &queue, float* out, const float* inp,
 //#if defined(__GNUC__) && !defined(__clang__)
 //__attribute__((optimize("no-finite-math-only")))
 //#endif
-sycl::event gelu_backward(sycl::queue &queue, float* dinp, float* inp, float* dout,
-                          const int N, const std::vector<sycl::event> &dependencies = {}) {
+template<int SG_SIZE>
+sycl::event gelu_backward2(sycl::queue &queue, float* dinp,
+                           const float* inp, const float* dout, const int N, const int sg_per_wg,
+                           const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const int ceilN = ((N + wg_size - 1) / wg_size) * wg_size;
+
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_GELU_BWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t i = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            for (int i = 0; i < N; i++) {
-#endif
-                float x = inp[i];
-                float cube = 0.044715f * x * x * x;
-                float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-                float tanh_out = TANH(tanh_arg);
-                float coshf_out = COSH(tanh_arg);
-                float sech_out = 1.0f / (coshf_out * coshf_out);
-                float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-                dinp[i] += local_grad * dout[i];
-#ifdef PARALLEL_GELU_BWD
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t i = item.get_global_id(0);
+            if (i >= N) return;
+            const float x = inp[i];
+            const float cube = 0.044715f * x * x * x;
+            const float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
+            const float tanh_out = TANH(tanh_arg);
+            const float coshf_out = COSH(tanh_arg);
+            const float sech_out = 1.0f / (coshf_out * coshf_out);
+            const float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
+            dinp[i] = (float)(local_grad * (float)dout[i]);
         };
-        cgh.parallel_for<class ker_gelu_backward_1>(sycl::range<1>(N), kernel);
-#else
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_gelu_backward_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
     });
     return last;
 }
 //#pragma float_control(pop)
 
-sycl::event residual_forward(sycl::queue &queue, float* out, const float* inp1, const float* inp2, const int N, const std::vector<sycl::event> &dependencies = {}) {
+sycl::event gelu_backward(sycl::queue &queue, float* dinp,
+                          const float* inp, const float* dout, const int N,
+                          const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return gelu_backward2<16>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 2;
+    return gelu_backward2<32>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 2;
+    return gelu_backward2<32>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_residual_forward_2;
+
+template <int SG_SIZE>
+sycl::event residual_forward2(sycl::queue &queue, float* out,
+                              const float* inp1, const float* inp2, const int N, const int sg_per_wg,
+                              const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const int ceilN = ((N + wg_size - 1) & (-wg_size));
+
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_RESID_FWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t i = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            for (int i = 0; i < N; i++) {
-#endif
-                out[i] = inp1[i] + inp2[i];
-#ifdef PARALLEL_RESID_FWD
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t i = item.get_global_id();
+            if (i < N) out[i] = inp1[i] + inp2[i];
         };
-        cgh.parallel_for<class ker_residual_forward_1>(sycl::range<1>(N), kernel);
-#else
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_residual_forward_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
     });
     return last;
 }
 
-sycl::event residual_backward(sycl::queue &queue, float* dinp1, float* dinp2, const float* dout, const int N, const std::vector<sycl::event> &dependencies = {}) {
+sycl::event residual_forward(sycl::queue &queue, float* dinp,
+                             const float* inp, const float* dout, const int N,
+                             const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return residual_forward2<16>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return residual_forward2<32>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return residual_forward2<32>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_residual_backward_2;
+
+template<int SG_SIZE>
+sycl::event residual_backward2(sycl::queue &queue, float* dinp1, float* dinp2,
+                               const float* dout, const int N, const int sg_per_wg,
+                               const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const int ceilN = ((N + wg_size - 1) & (-wg_size));
+
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_RESID_BWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t i = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            for (int i = 0; i < N; i++) {
-#endif
-                dinp1[i] += dout[i];
-                dinp2[i] += dout[i];
-#ifdef PARALLEL_RESID_BWD
-        };
-        cgh.parallel_for<class ker_residual_backward_1>(sycl::range<1>(N), kernel);
-#else
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t i = item.get_global_id(0);
+            if (i < N) {
+                const float d = dout[i];
+                dinp1[i] += d;
+                dinp2[i] += d;
             }
         };
-        cgh.host_task(kernel);
+        cgh.parallel_for<class ker_residual_backward_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
+    });
+    return last;
+}
+
+sycl::event residual_backward(sycl::queue &queue, float* dinp1, float* dinp2,
+                              const float* dout, const int N,
+                              const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return residual_backward2<16>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return residual_backward2<32>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return residual_backward2<32>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
 #endif
+}
+
+template <int SG_SIZE>
+class ker_online_softmax_forward_2;
+
+template<int SG_SIZE>
+sycl::event online_softmax_forward2(sycl::queue &queue, float* probs, const float* logits,
+                                    const int B, const int T, const int V, const int Vp, const int sg_per_wg,
+                                    const std::vector<sycl::event> &dependencies = {}) {
+    // Possibly we must force a power-of-2 sg_per_wg instead of adjusting it
+    // for reduction loops to work as expected.
+    const int adjusted_sg_per_wg = std::min((V + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt  = item.get_global_id(0);
+            const size_t lid = item.get_local_linear_id();
+            sycl::group gr   = item.get_group();
+
+            // probs <- softmax(logits)
+            const float* logits_bt = logits + bt * Vp;
+            float* probs_bt        = probs + bt * Vp;
+
+            // maxval is only calculated and subtracted for numerical stability
+            float local_maxval=-std::numeric_limits<float>::max();
+            float local_sum = 0.0f;
+            for (int i = lid; i < V; i += wg_size) {
+                if (logits_bt[i] > local_maxval) {
+                    local_sum = local_sum * EXP(local_maxval - logits_bt[i]) + 1.0f;
+                    local_maxval = logits_bt[i];
+                }
+                else {
+                    local_sum += EXP(logits_bt[i] - local_maxval);
+                }
+            }
+            // Perform local reduction within a sub_group
+            const float maxval = sycl::reduce_over_group(gr, local_maxval, sycl::maximum<float>());
+            local_sum         *= (maxval > local_maxval ? EXP(local_maxval - maxval) : 1.0f);
+            const float sum    = sycl::reduce_over_group(gr, local_sum, sycl::plus<float>());
+
+            // note we only loop to V, leaving the padded dimensions
+            for (int i = lid; i < V; i += wg_size) {
+                probs_bt[i] = EXP(logits_bt[i] - maxval) / sum;
+            }
+
+            // for extra super onlinety we may wish to include this too,
+            // forcing the probabilities here to be zero, but it shouldn't matter
+            for (int i = V + lid; i < Vp; i += wg_size) {
+                probs_bt[i] = 0.0f;
+            }
+        };
+        cgh.parallel_for<class ker_online_softmax_forward_2<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(B*T, wg_size), sycl::range<2>(1, wg_size)), kernel);
     });
     return last;
 }
@@ -936,140 +1097,127 @@ sycl::event residual_backward(sycl::queue &queue, float* dinp1, float* dinp2, co
 sycl::event softmax_forward(sycl::queue &queue, float* probs, float* logits,
                             const int B, const int T, const int V, const int Vp,
                             const std::vector<sycl::event> &dependencies = {}) {
-    // output: probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
-    // input: logits is (B,T,Vp) of the unnormalized log probabilities
-    // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
-    // example: Vp is 50304 and V is 50257
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return online_softmax_forward2<32>(queue, probs, logits, B, T, V, Vp, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return online_softmax_forward2<32>(queue, probs, logits, B, T, V, Vp, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return online_softmax_forward2<32>(queue, probs, logits, B, T, V, Vp, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_crossentropy_forward_2;
+
+template<int SG_SIZE>
+sycl::event crossentropy_forward2(sycl::queue &queue, float* losses,
+                                  const float* probs, const int* targets,
+                                  const int B, const int T, const int Vp, const int sg_per_wg,
+                                  const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min((B*T + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const size_t ceilBT = ((B * T + wg_size - 1) / wg_size) * wg_size;
+
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_SOFTMAX_FWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t bt = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            #pragma omp parallel for collapse(2)
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const size_t bt = b*T+t;
-#endif
-                    // probs <- softmax(logits)
-                    float* logits_bt = logits + bt * Vp;
-                    float* probs_bt = probs + bt * Vp;
-
-                    // maxval is only calculated and subtracted for numerical stability
-                    float maxval = -10000.0f; // TODO something better
-                    for (int i = 0; i < V; i++) {
-                        if (logits_bt[i] > maxval) {
-                            maxval = logits_bt[i];
-                        }
-                    }
-                    float sum = 0.0f;
-                    for (int i = 0; i < V; i++) {
-                        probs_bt[i] = EXP(logits_bt[i] - maxval);
-                        sum += probs_bt[i];
-                    }
-                    // note we only loop to V, leaving the padded dimensions
-                    for (int i = 0; i < V; i++) {
-                        probs_bt[i] /= sum;
-                    }
-                    // for extra super safety we may wish to include this too,
-                    // forcing the probabilities here to be zero, but it shouldn't matter
-                    for (int i = V; i < Vp; i++) {
-                        probs_bt[i] = 0.0f;
-                    }
-#ifdef PARALLEL_SOFTMAX_FWD
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bt = item.get_global_id(0);
+            if (bt >= B * T) return;
+            // loss = -log(probs[target])
+            const float* probs_bt = probs + bt * Vp;
+            const int ix = targets[bt];
+            losses[bt] = -LOG(probs_bt[ix]);
         };
-        cgh.parallel_for<class ker_softmax_forward_1>(sycl::range<1>(B*T), kernel);
-#else
-                }
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_crossentropy_forward_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilBT), sycl::range<1>(wg_size)), kernel);
     });
     return last;
 }
 
 sycl::event crossentropy_forward(sycl::queue &queue, float* losses,
-                                 float* probs, int* targets,
-                                 int B, int T, int Vp,
+                                 const float* probs, const int* targets,
+                                 const int B, const int T, const int Vp,
                                  const std::vector<sycl::event> &dependencies = {}) {
-    // output: losses is (B,T) of the individual losses at each position
-    // input: probs are (B,T,Vp) of the probabilities
-    // input: targets is (B,T) of integers giving the correct index in logits
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return crossentropy_forward2<16>(queue, losses, probs, targets, B, T, Vp, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 2;
+    return crossentropy_forward2<32>(queue, losses, probs, targets, B, T, Vp, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 2;
+    return crossentropy_forward2<32>(queue, losses, probs, targets, B, T, Vp, sg_per_wg, dependencies);
+#endif
+}
+
+template <int SG_SIZE>
+class ker_crossentropy_softmax_backward_4;
+
+template<int SG_SIZE>
+sycl::event crossentropy_softmax_backward4(sycl::queue &queue, float* dlogits,
+                                           const float* dlosses, const float* probs, const int* targets,
+                                           const size_t B, const size_t T, const size_t V, const size_t Vp, const int sg_per_wg,
+                                           const std::vector<sycl::event> &dependencies = {}) {
+    const int adjusted_sg_per_wg = std::min<size_t>((V + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const size_t ceilV = ((V + wg_size - 1) / wg_size) * wg_size;
+    // backwards through both softmax and crossentropy
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_CROSSENTROPY_FWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t bt = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const int bt = b*T+t;
-#endif
-                    // loss = -log(probs[target])
-                    float* probs_bt = probs + bt * Vp;
-                    const int ix = targets[bt];
-                    losses[bt] = -LOG(probs_bt[ix]);
-#ifdef PARALLEL_CROSSENTROPY_FWD
+        auto kernel = [=](sycl::nd_item<2> item) {
+            const size_t bt = item.get_global_id(0);
+            const size_t v  = item.get_global_id(1);
+            sycl::group gr  = item.get_group();
+            if (v >= V) return;
+
+            float* dlogits_bt     = dlogits + bt * Vp;
+            const float* probs_bt = probs + bt * Vp;
+            const float dloss     = dlosses[bt];
+            const int ix          = targets[bt];
+            // note we only loop to V, leaving the padded dimensions
+            // of dlogits untouched, so gradient there stays at zero
+            const float p = probs_bt[v];
+            const float indicator = (v == ix ? 1.0f : 0.0f);
+            dlogits_bt[v] += (p - indicator) * dloss;
         };
-        cgh.parallel_for<class ker_crossentropy_forward_1>(sycl::range<1>(B*T), kernel);
-#else
-                }
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_crossentropy_softmax_backward_4<SG_SIZE>>(
+                sycl::nd_range<2>(sycl::range<2>(B * T, ceilV), sycl::range<2>(1, wg_size)), kernel);
     });
     return last;
 }
 
 sycl::event crossentropy_softmax_backward(sycl::queue &queue, float* dlogits,
-                                          float* dlosses, float* probs, int* targets,
-                                          int B, int T, int V, int Vp,
+                                          const float* dlosses, const float* probs, const int* targets,
+                                          const size_t B, const size_t T, const size_t V, const size_t Vp,
                                           const std::vector<sycl::event> &dependencies = {}) {
-    // backwards through both softmax and crossentropy
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-#ifdef PARALLEL_SOFTMAX_CROSSENTROPY_BWD
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t bt = item.get_id(0);
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return crossentropy_softmax_backward4<32>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 8;
+    return crossentropy_softmax_backward4<32>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg, dependencies);
 #else
-        auto kernel = [=]() {
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < T; t++) {
-                    const int bt = b*T+t;
+    constexpr int sg_per_wg = 8;
+    return crossentropy_softmax_backward4<32>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg, dependencies);
 #endif
-                    float* dlogits_bt = dlogits + bt * Vp;
-                    float* probs_bt = probs + bt * Vp;
-                    float dloss = dlosses[bt];
-                    const int ix = targets[bt];
-                    // note we only loop to V, leaving the padded dimensions
-                    // of dlogits untouched, so gradient there stays at zero
-                    for (int i = 0; i < V; i++) {
-                        float p = probs_bt[i];
-                        float indicator = i == ix ? 1.0f : 0.0f;
-                        dlogits_bt[i] += (p - indicator) * dloss;
-                    }
-#ifdef PARALLEL_SOFTMAX_CROSSENTROPY_BWD
-        };
-        cgh.parallel_for<class ker_softmax_crossentropy_backward_1>(sycl::range<1>(B * T), kernel);
-#else
-                }
-            }
-        };
-        cgh.host_task(kernel);
-#endif
-    });
-    return last;
 }
 
-sycl::event adamw(sycl::queue &queue,
-                  float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, const int t, const size_t num_parameters,
-                  const float learning_rate, const float beta1, const float beta2, const float eps, const float weight_decay,
-                  const std::vector<sycl::event> &dependencies = {}) {
+template <int SG_SIZE>
+class ker_adamw_2;
+
+template<int SG_SIZE>
+sycl::event adamw2(sycl::queue &queue,
+                   float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, const int t, const size_t num_parameters,
+                   const float learning_rate, const float beta1, const float beta2, const float eps, const float weight_decay,
+                   const int sg_per_wg, const std::vector<sycl::event> &dependencies = {}) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+
+    const int adjusted_sg_per_wg = std::min<size_t>((num_parameters + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    const size_t ceilN = ((num_parameters + wg_size - 1) & (-wg_size));
 
     const float oneminusbeta1 = 1.0f - beta1;
     const float oneminusbeta2 = 1.0f - beta2;
@@ -1078,39 +1226,48 @@ sycl::event adamw(sycl::queue &queue,
 
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-#ifdef PARALLEL_GPT2_UPDATE
-        auto kernel = [=](sycl::item<1> item) {
-            const size_t i = item.get_id(0);
-#else
-        auto kernel = [=]() {
-            #pragma omp parallel for
-            for (size_t i = 0; i < num_parameters; ++i) {
-#endif
-                const float param = params_memory[i];
-                const float grad = grads_memory[i];
+        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t i = item.get_global_id(0);
+            if (i >= num_parameters) return;
+            const float param = params_memory[i];
+            const float grad = grads_memory[i];
 
-                // update the first moment (momentum)
-                const float m = beta1 * m_memory[i] + oneminusbeta1 * grad;
-                // update the second moment (RMSprop)
-                const float v = beta2 * v_memory[i] + oneminusbeta2 * grad * grad;
-                // bias-correct both moments
-                const float m_hat = m / beta1_correction;
-                const float v_hat = v / beta2_correction;
+            // update the first moment (momentum)
+            const float m = beta1 * m_memory[i] + oneminusbeta1 * grad;
+            // update the second moment (RMSprop)
+            const float v = beta2 * v_memory[i] + oneminusbeta2 * grad * grad;
+            // bias-correct both moments
+            const float m_hat = m / beta1_correction;
+            const float v_hat = v / beta2_correction;
 
-                // update
-                m_memory[i] = m;
-                v_memory[i] = v;
-                params_memory[i] -= learning_rate * (m_hat / (SQRT(v_hat) + eps) + weight_decay * param);
-#ifdef PARALLEL_GPT2_UPDATE
+            // update
+            m_memory[i] = m;
+            v_memory[i] = v;
+            params_memory[i] -= learning_rate * (m_hat / (SQRT(v_hat) + eps) + weight_decay * param);
         };
-        cgh.parallel_for<class ker_adamw_1>(sycl::range<1>(num_parameters), kernel);
-#else
-            }
-        };
-        cgh.host_task(kernel);
-#endif
+        cgh.parallel_for<class ker_adamw_2<SG_SIZE>>(
+                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
     });
     return last;
+}
+
+sycl::event adamw(sycl::queue &queue,
+                  float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, const int t, const size_t num_parameters,
+                  const float learning_rate, const float beta1, const float beta2, const float eps, const float weight_decay,
+                  const std::vector<sycl::event> &dependencies = {}) {
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 64;
+    return adamw2<16>(queue, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
+                      learning_rate, beta1, beta2, eps, weight_decay, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return adamw2<32>(queue, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
+                      learning_rate, beta1, beta2, eps, weight_decay, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return adamw2<32>(queue, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
+                      learning_rate, beta1, beta2, eps, weight_decay, sg_per_wg, dependencies);
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1580,7 +1737,6 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
             cgh.depends_on(ev_ce);
             auto losses = model->acts.losses;
             // Single work-group kernel to allow easy reduction
-#ifdef PARALLEL_GPT2_LOSS_FWD
             auto kernel = [=](sycl::nd_item<1> item) {
                 const size_t lid = item.get_global_id();
                 sycl::group gr   = item.get_group();
@@ -1594,17 +1750,6 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
             };
             cgh.parallel_for<class ker_loss_reduction>(
                     sycl::nd_range<1>(sycl::range<1>(max_workgroup_size), sycl::range<1>(max_workgroup_size)), kernel);
-#else
-            auto kernel = [=]() {
-                float mean_loss = 0.0f;
-                for (size_t i = 0; i < B * T; i++) {
-                    mean_loss += losses[i];
-                }
-                mean_loss /= B*T;
-                mean_loss_host[0] = mean_loss;
-            };
-            cgh.host_task(kernel);
-#endif
         });
         ev_last = queue.memcpy(&model->mean_loss, mean_loss_host, sizeof(float), ev_loss);
         ev_last.wait(); // Must wait to free mean_loss_host
