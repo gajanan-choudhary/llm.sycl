@@ -47,6 +47,13 @@ endif
 ifneq ($(DEVICE),gpu)
     SYCL_LDLIBS += -ltbb
 endif
+ifeq ($(DEVICE),cpu)
+    SYCL_FLAGS += -DSYCL_CPU
+else ifeq ($(DEVICE_VENDOR),nvidia)
+    SYCL_FLAGS += -DSYCL_CUDA
+else
+	# No flag added for other GPUs for now
+endif
 
 # Ahead-of-time compilation flags, if possible
 ifeq ($(SYCL_AOT_COMPILE),pvc)
@@ -60,6 +67,15 @@ endif
 ifeq ($(SYCL_AOT_COMPILE),h100)
     SYCL_FLAGS += -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90
     SYCL_FLAGS += -D_DISABLE_SG_SIZE_8 -D_DISABLE_SG_SIZE_16
+endif
+ifeq ($(BUILD_ONEMKL_INTERFACES),yes)
+    SYCL_FLAGS += -DONEMKL_INTERFACES
+    SYCL_INCLUDES += -I$(ONEMKL_ROOT)/include
+    ifeq ($(DEVICE_VENDOR),intel)
+        SYCL_LDLIBS += -L$(ONEMKL_ROOT)/lib -lonemkl -lonemkl_blas_mklgpu
+    else ifeq ($(DEVICE_VENDOR),nvidia)
+        SYCL_LDLIBS += -L$(ONEMKL_ROOT)/lib -lonemkl -lonemkl_blas_cublas
+    endif
 endif
 
 # Default rule for our SYCL files

@@ -17,7 +17,8 @@ TODO: Try oneDNN / oneMKL for version 3
 
 Observations as of 08/03/2024: version 2 with SG_SIZE=32, SG_PER_WG=1 is fastest on CPU device @ 0.27 TFLOP/s on 224T SPR
                                version 2 with SG_SIZE=32, SG_PER_WG={1, 2, 32} are fastest on GPU device @ 0.53 TFLOP/s on 1-tile PVC 512 EU
-
+                   08/12/2024: version 3 using oneMKL Interfaces with cuBLAS/Intel oneMKL backends is obviously the fastest by more
+                               than an order of magnitude @ 32.5 ms / 9.5 TFLOP/s on PVC, and 17 ms / 18.2 TFLOP/s on A100!
 */
 
 #include <stdio.h>
@@ -27,6 +28,10 @@ Observations as of 08/03/2024: version 2 with SG_SIZE=32, SG_PER_WG=1 is fastest
 #endif
 #include "common.h"
 #include <sycl/sycl.hpp>
+
+#ifdef ONEMKL_INTERFACES
+#include "oneapi/mkl/blas.hpp"
+#endif
 
 // ----------------------------------------------------------------------------
 // GFLOP/s
@@ -238,6 +243,50 @@ sycl::event matmul_backward2(sycl::queue &queue, float* dinp, float* dweight, fl
     return queue.ext_oneapi_submit_barrier({ev_dinp, ev_dweight, ev_dbias});
 }
 
+#ifdef ONEMKL_INTERFACES
+sycl::event matmul_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                                              const float* dout, const float* inp, const float* weight,
+                                              int B, int T, int C, int OC,
+                                              const std::vector<sycl::event> &dependencies = {})
+{
+    // inp is (B*T, C), weight is (OC, C). Bias is (OC) and is added on separately later.
+    // out is (B*T, OC). All inputs are in row-major format, but apparently
+    // row-major is not supported, so we must flip-around some things to get
+    // what we want with column-major GEMM.
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const oneapi::mkl::transpose opNonTrans = oneapi::mkl::transpose::nontrans;
+    const oneapi::mkl::transpose opTrans    = oneapi::mkl::transpose::trans;
+
+    sycl::event ev_dinp = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opNonTrans,
+            C, B*T, OC, alpha, weight, C, dout, OC, beta, dinp, C, dependencies);
+
+    sycl::event ev_dweight = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opTrans,
+            C, OC, B*T, alpha, inp, C, dout, OC, beta, dweight, C, {ev_dinp});
+
+    // backward into bias, parallelize over output channels OC
+    sycl::event ev_dbias = ev_dweight; //sycl::event();
+    if (dbias != NULL) {
+        ev_dbias = queue.submit([&](sycl::handler &cgh) {
+            cgh.depends_on(ev_dweight);
+            auto kernel = [=](sycl::item<1> item) {
+                const size_t o = item.get_id(0);
+                float sum = float(0);
+                for (int bt = 0; bt < B*T; bt++) {
+                    const float* dout_bt = dout + bt * OC;
+                    sum += dout_bt[o];
+                }
+                dbias[o] += sum;
+            };
+            cgh.parallel_for<class ker_matmul_backward_onemkl_interfaces_dbias>(sycl::range<1>(OC), kernel);
+        });
+    }
+
+    return ev_dbias; //queue.ext_oneapi_submit_barrier({ev_dinp, ev_dweight, ev_dbias});
+}
+#endif // #ifdef ONEMKL_INTERFACES
+
 // kernel version dispatch
 sycl::event matmul_backward(int kernel_num,
                             sycl::queue &queue, float* dinp, float* dweight, float* dbias,
@@ -267,6 +316,11 @@ sycl::event matmul_backward(int kernel_num,
                 exit(2);
             }
         } break;
+#ifdef ONEMKL_INTERFACES
+        case 3: {
+            return matmul_backward_onemkl_interfaces(queue, dinp, dweight, dbias, dout, inp, weight, B, T, C, OC);
+        } break;
+#endif // #ifdef ONEMKL_INTERFACES
         default: {
             printf("Invalid kernel number\n");
             exit(1);
@@ -409,6 +463,32 @@ int main(int argc, char **argv) {
     }
     if (run_all) kernel_num++;
     printf("\n");
+
+#ifdef ONEMKL_INTERFACES
+    // Test kernel 3
+    if (kernel_num == 3) {
+        printf("************************************************.\n");
+        printf("Checking kernel set #%i.\n", kernel_num);
+        matmul_backward(kernel_num, queue, d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, B, T, C, OC, 0, 0);
+        queue.wait();
+        validate_result(queue, d_dinp, dinp, "dinp", B * T * C, 1e-2f);
+        validate_result(queue, d_dweight, dweight, "dweight", OC * C, 1e-2f);
+        validate_result(queue, d_dbias, dbias, "dbias", OC, 1e-2f);
+        printf("All results match. Benchmarking kernel %i.\n", kernel_num);
+        double elapsed_ms = benchmark_kernel(repeat_times, matmul_backward, kernel_num, queue,
+                                             d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight,
+                                             B, T, C, OC, 0, 0);
+        double tflops = get_matmul_bwd_tflops(elapsed_ms, B, T, C, OC);
+        printf("kernel %2i | time %.4f ms | tflops %.2f\n", kernel_num, elapsed_ms, tflops);
+
+        queue.fill<float>(d_dinp, float(0), B * T * C);
+        queue.fill<float>(d_dweight, float(0), OC * C);
+        queue.fill<float>(d_dbias, float(0), OC);
+        queue.wait();
+    }
+    if (run_all) kernel_num++;
+    printf("\n");
+#endif // #ifdef ONEMKL_INTERFACES
 
     // free memory
     queue.wait_and_throw();

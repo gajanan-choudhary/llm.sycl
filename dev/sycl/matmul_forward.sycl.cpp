@@ -17,7 +17,8 @@ TODO: Try oneDNN / oneMKL for version 3
 
 Observations as of 08/03/2024: version 1 is faster on CPU device @ 0.86 TFLOP/s on 224T SPR, unknown why
                                version 2 with SG_SIZE = 32, SG_PER_WG={4, 8} are fastest on GPU device @ 0.75 TFLOP/s on 1-tile PVC 512 EU
-
+                   08/12/2024: version 5 using oneMKL Interfaces with cuBLAS/Intel oneMKL backends is obviously the fastest by more
+                               than an order of magnitude @ 7 ms / 22 TFLOP/s on PVC, and 9.4 ms / 16.5 TFLOP/s on A100!
 */
 
 #include <stdio.h>
@@ -27,6 +28,10 @@ Observations as of 08/03/2024: version 1 is faster on CPU device @ 0.86 TFLOP/s 
 #endif
 #include "common.h"
 #include <sycl/sycl.hpp>
+
+#ifdef ONEMKL_INTERFACES
+#include "oneapi/mkl/blas.hpp"
+#endif
 
 // ----------------------------------------------------------------------------
 // GFLOP/s
@@ -231,6 +236,43 @@ sycl::event matmul_forward4(sycl::queue &queue, float* out,
     return last;
 }
 
+#ifdef ONEMKL_INTERFACES
+sycl::event matmul_forward_onemkl_interfaces(sycl::queue &queue, float* out,
+                                             const float* inp, const float* weight, const float* bias,
+                                             int B, int T, int C, int OC,
+                                             const std::vector<sycl::event> &dependencies = {})
+{
+    // inp is (B*T, C), weight is (OC, C). Bias is (OC) and is added on separately later.
+    // out is (B*T, OC). All inputs are in row-major format, but apparently
+    // row-major is not supported, so we must flip-around some things to get
+    // what we want with column-major GEMM.
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const oneapi::mkl::transpose opA = oneapi::mkl::transpose::trans;
+    const oneapi::mkl::transpose opB = oneapi::mkl::transpose::nontrans;
+    sycl::event ev_blas_gemm = oneapi::mkl::blas::column_major::gemm(queue, opA, opB,
+            OC, B*T, C, alpha, weight, C, inp, C, beta, out, OC, dependencies);
+
+    // Add in bias:
+    if (bias != NULL) {
+        sycl::event ev_bias = queue.submit([&](sycl::handler &cgh) {
+            cgh.depends_on(ev_blas_gemm);
+            auto kernel = [=](sycl::item<2> item) {
+                const size_t bt = item.get_id(0);
+                const size_t o  = item.get_id(1);
+                out[bt * OC + o] += bias[o];
+            };
+            cgh.parallel_for<class ker_matmul_forward_cublas_bias>(sycl::range<2>(B*T, OC), kernel);
+        });
+        return ev_bias;
+    }
+    else {
+        return ev_blas_gemm;
+    }
+}
+#endif // #ifdef ONEMKL_INTERFACES
+
 // kernel version dispatch
 sycl::event matmul_forward(int kernel_num,
                            sycl::queue &queue, float* out,
@@ -282,6 +324,11 @@ sycl::event matmul_forward(int kernel_num,
                 exit(2);
             }
         } break;
+#ifdef ONEMKL_INTERFACES
+        case 5: {
+            return matmul_forward_onemkl_interfaces(queue, out, inp, weight, bias, B, T, C, OC);
+        } break;
+#endif // #ifdef ONEMKL_INTERFACES
         default: {
             printf("Invalid kernel number\n");
             exit(1);
@@ -416,6 +463,29 @@ int main(int argc, char **argv) {
         if (run_all) kernel_num++;
         printf("\n");
     }
+
+#ifdef ONEMKL_INTERFACES
+    if (kernel_num == 5) {
+        printf("************************************************.\n");
+        printf("Checking kernel set #%i.\n", kernel_num);
+        matmul_forward(kernel_num, queue, d_out, d_inp, d_weight, d_bias, B, T, C, OC, 0, 0);
+        queue.wait();
+        validate_result(queue, d_out, out, "out", B * T * OC, 1e-4f);
+        printf("All results match. Benchmarking kernel %i.\n", kernel_num);
+        double elapsed_ms = benchmark_kernel(repeat_times, matmul_forward,
+                                             kernel_num, queue, d_out, d_inp, d_weight, d_bias,
+                                             B, T, C, OC, 0, 0);
+        // napkin math: estimate the flops achieved
+        // e.g. A100 40GB PCIe is advertised at 19.5 TFLOPS fp32
+        double tflops = get_matmul_fwd_tflops(elapsed_ms, B, T, C, OC);
+        printf("kernel %2i | time %.4f ms | tflops %.2f\n", kernel_num, elapsed_ms, tflops);
+
+        queue.fill<float>(d_out, float(0), B * T * OC);
+        queue.wait();
+    }
+    if (run_all) kernel_num++;
+    printf("\n");
+#endif // #ifdef ONEMKL_INTERFACES
 
     // free memory
     queue.wait_and_throw();
