@@ -122,9 +122,9 @@ int main(int argc, char *argv[]) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        last = gpt2_forward(queue, &model, x, y, B, T, {last});
+        last = gpt2_forward(queue, &model, x, y, B, T, /* dump_timings = */ false, {last});
         last = gpt2_zero_grad(queue, &model, {last});
-        last = gpt2_backward(queue, &model, {last});
+        last = gpt2_backward(queue, &model, /* dump_timings = */ false, {last});
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;

@@ -20,6 +20,7 @@ aot=pvc # Optional ahead-of-time (AOT) compilation on Intel GPUs
 #aot=a100 #h100 # Compulsory AOT compilation for Nvidia GPUs
 
 # Build options, if any
+timeprofile=1 # or 2
 debug=no
 
 if [[ "$device" == "cpu" ]]; then
@@ -52,7 +53,7 @@ sycl-ls
 echo "Cleaning up past builds"
 make clean
 echo "Beginning new builds"
-make -j 2 DEVICE=${device} DEVICE_VENDOR=${vendor} DEBUG=${debug} SYCL_AOT_COMPILE=${aot} \
+make -j 2 DEVICE=${device} DEVICE_VENDOR=${vendor} TIME_PROFILE=${timeprofile} DEBUG=${debug} SYCL_AOT_COMPILE=${aot} \
      train_gpt2sycl test_gpt2sycl
 
 echo "Submit training run: train_gp2sycl"

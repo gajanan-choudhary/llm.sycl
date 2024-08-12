@@ -1332,6 +1332,7 @@ void gpt2_build_from_checkpoint(sycl::queue &queue, GPT2 *model, const char* che
 }
 
 sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targets, size_t B, size_t T,
+                         const bool dump_timings,
                          const std::vector<sycl::event> &dependencies = {}) {
     // targets are optional and could be NULL
 
@@ -1407,11 +1408,27 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
     // cache the inputs/targets
     auto ev_copy_inputs = queue.memcpy(model->inputs, inputs, B * T * sizeof(int), dependencies);
 
+#if (TIMEPROFILE >= 2)
+    queue.wait();
+    struct timespec start, end;
+    // Variables for tracking wall-clock timings
+    double rl_ms = 0.0, cs_ms = 0.0, mm_ms = 0.0, ln_ms = 0.0;
+    double rs_ms = 0.0, ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
+#endif
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
+#if (TIMEPROFILE >= 2)
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     auto ev_last = encoder_forward(queue, acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, {ev_copy_inputs}); // encoding goes into residual[0]
+#if (TIMEPROFILE >= 2)
+    ev_last.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ec_ms += get_elapsed_ms(start, end);
+#endif
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1449,31 +1466,116 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
+#if (TIMEPROFILE >= 2)
+        ev_last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         auto ev_ln = layernorm_forward(queue, l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, {ev_last});
+#if (TIMEPROFILE >= 2)
+        ev_ln.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        ln_ms += get_elapsed_ms(start, end);
+#endif
         auto ev_mm = matmul_forward(queue, l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, {ev_ln});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         auto ev_at = attention_forward(queue, l_atty, l_preatt, l_att, l_qkv, B, T, C, NH, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_at.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        at_ms += get_elapsed_ms(start, end);
+#endif
         ev_mm = matmul_forward(queue, l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, {ev_at});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        mm_ms += get_elapsed_ms(end, start);
+#endif
         auto ev_rs = residual_forward(queue, l_residual2, residual, l_attproj, B*T*C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_rs.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rs_ms += get_elapsed_ms(start, end);
+#endif
         ev_ln = layernorm_forward(queue, l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, {ev_rs});
+#if (TIMEPROFILE >= 2)
+        ev_ln.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         ev_mm = matmul_forward(queue, l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, {ev_ln});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         auto ev_gl = gelu_forward(queue, l_fch_gelu, l_fch, B*T*4*C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_gl.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        gl_ms += get_elapsed_ms(end, start);
+#endif
         ev_mm = matmul_forward(queue, l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, {ev_gl});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         ev_rs = residual_forward(queue, l_residual3, l_residual2, l_fcproj, B*T*C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_rs.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        rs_ms += get_elapsed_ms(end, start);
+#endif
         ev_last = ev_rs;
     }
+#if (TIMEPROFILE >= 2)
+    ev_last.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     auto ev_ln = layernorm_forward(queue, acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C, {ev_last});
+#if (TIMEPROFILE >= 2)
+    ev_ln.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ln_ms += get_elapsed_ms(start, end);
+#endif
     auto ev_mm = matmul_forward(queue, acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp, {ev_ln});
+#if (TIMEPROFILE >= 2)
+    ev_mm.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    mm_ms += get_elapsed_ms(end, start);
+#endif
     ev_last = softmax_forward(queue, acts.probs, acts.logits, B, T, V, Vp, {ev_mm});
+#if (TIMEPROFILE >= 2)
+    ev_last.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    cs_ms += get_elapsed_ms(start, end);
+#endif
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         //printf("model->acts.losses = %p, model->acts.probs = %p, model->targets = %p\n", model->acts.losses, model->acts.probs, model->targets);
         auto ev_copy_targets = queue.memcpy(model->targets, targets, B * T * sizeof(int), dependencies);
+#if (TIMEPROFILE >= 2)
+        ev_copy_targets.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         auto ev_ce = crossentropy_forward(queue, model->acts.losses, model->acts.probs, model->targets, B, T, Vp, {ev_copy_targets, ev_last});
+#if (TIMEPROFILE >= 2)
+        ev_ce.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        cs_ms += get_elapsed_ms(start, end);
+#endif
         // for convenience also evaluate the mean loss
         const size_t max_workgroup_size = queue.get_device().get_info<sycl::info::device::max_work_group_size>();
         float *mean_loss_host = (float *)hostMallocCheck(sizeof(float), queue);
+#if (TIMEPROFILE >= 2)
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         auto ev_loss = queue.submit([&](sycl::handler &cgh){
             cgh.depends_on(ev_ce);
             auto losses = model->acts.losses;
@@ -1504,15 +1606,26 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
             cgh.host_task(kernel);
 #endif
         });
-        auto ev_loss_d2h = queue.memcpy(&model->mean_loss, mean_loss_host, sizeof(float), ev_loss);
-        ev_loss_d2h.wait();
+        ev_last = queue.memcpy(&model->mean_loss, mean_loss_host, sizeof(float), ev_loss);
+        ev_last.wait(); // Must wait to free mean_loss_host
+#if (TIMEPROFILE >= 2)
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rl_ms += get_elapsed_ms(start, end);
+#endif
         sycl::free(mean_loss_host, queue);
-        return ev_loss_d2h;
     } else {
         // if we don't have targets, we don't have a loss
         model->mean_loss = -1.0f;
-        return ev_last;
     }
+
+#if (TIMEPROFILE >= 2)
+    if (dump_timings) {
+        printf("[FWD] rl_ms = %10.3f, cs_ms = %10.3f, mm_ms = %10.3f, ln_ms = %10.3f\n", rl_ms, cs_ms, mm_ms, ln_ms);
+        printf("[FWD] rs_ms = %10.3f, gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", rs_ms, gl_ms, at_ms, ec_ms);
+    }
+#endif
+
+    return ev_last;
 }
 
 sycl::event gpt2_zero_grad(sycl::queue &queue, GPT2 *model,
@@ -1530,6 +1643,7 @@ sycl::event gpt2_zero_grad(sycl::queue &queue, GPT2 *model,
 }
 
 sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
+                          const bool dump_timings,
                           const std::vector<sycl::event> &dependencies = {}) {
 
     // double check we forwarded previously, with targets
@@ -1538,12 +1652,31 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         exit(1);
     }
 
+#if (TIMEPROFILE >= 2)
+    queue.wait();
+    struct timespec start, end;
+    // Variables for tracking wall-clock timings
+    double il_ms = 0.0, cs_ms = 0.0, mm_ms = 0.0, ln_ms = 0.0;
+    double rs_ms = 0.0, ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
+#endif
     // lazily allocate the memory for gradients of the weights and activations, if needed
     std::vector<sycl::event> depends = dependencies;
     if (model->grads_memory == NULL) {
         model->grads_memory = malloc_and_point_parameters(queue, &model->grads, model->param_sizes);
         model->grads_acts_memory = malloc_and_point_activations(queue, &model->grads_acts, model->act_sizes);
+
+#if (TIMEPROFILE >= 2)
+        queue.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         auto ev_zero_grad = gpt2_zero_grad(queue, model, depends);
+#if (TIMEPROFILE >= 2)
+        ev_zero_grad.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double zg_ms = get_elapsed_ms(start, end);
+        printf("zg_ms = %10.3f\n", zg_ms);
+#endif
+
         depends.push_back(ev_zero_grad);
     }
 
@@ -1563,17 +1696,42 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     ActivationTensors grads_acts = model->grads_acts;
 
     // do a training step
+#if (TIMEPROFILE >= 2)
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // technically this is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     const float dloss_mean = 1.0f / (B*T);
     auto ev_init_loss = queue.fill<float>(grads_acts.losses, dloss_mean, B * T, depends);
 
+#if (TIMEPROFILE >= 2)
+    ev_init_loss.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    il_ms += get_elapsed_ms(start, end);
+#endif
+
     auto ev_ce_sm = crossentropy_softmax_backward(queue, grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp, {ev_init_loss});
+#if (TIMEPROFILE >= 2)
+    ev_ce_sm.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    cs_ms += get_elapsed_ms(end, start);
+#endif
     auto ev_mm = matmul_backward(queue, grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp, {ev_ce_sm});
+#if (TIMEPROFILE >= 2)
+    ev_mm.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    mm_ms += get_elapsed_ms(start, end);
+#endif
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
     auto ev_ln = layernorm_backward(queue, dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+    ev_ln.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    ln_ms += get_elapsed_ms(end, start);
+#endif
 
     sycl::event ev_last = ev_ln;
     for (int l = L-1; l >= 0; l--) {
@@ -1628,20 +1786,92 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
+#if (TIMEPROFILE >= 2)
+        ev_last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+#endif
         // backprop this layer
         auto ev_rs = residual_backward(queue, dl_residual2, dl_fcproj, dl_residual3, B*T*C, {ev_last});
+#if (TIMEPROFILE >= 2)
+        ev_rs.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        rs_ms += get_elapsed_ms(end, start);
+#endif
         ev_mm = matmul_backward(queue, dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C, {ev_rs});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         auto ev_gl = gelu_backward(queue, dl_fch, l_fch, dl_fch_gelu, B*T*4*C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_gl.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        gl_ms += get_elapsed_ms(end, start);
+#endif
         ev_mm = matmul_backward(queue, dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C, {ev_gl});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         ev_ln = layernorm_backward(queue, dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_ln.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         ev_rs = residual_backward(queue, dresidual, dl_attproj, dl_residual2, B*T*C, {ev_ln});
+#if (TIMEPROFILE >= 2)
+        ev_rs.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rs_ms += get_elapsed_ms(start, end);
+#endif
         ev_mm = matmul_backward(queue, dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C, {ev_rs});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        mm_ms += get_elapsed_ms(end, start);
+#endif
         auto ev_at = attention_backward(queue, dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_at.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        at_ms += get_elapsed_ms(start, end);
+#endif
         ev_mm = matmul_backward(queue, dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C, {ev_at});
+#if (TIMEPROFILE >= 2)
+        ev_mm.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        mm_ms += get_elapsed_ms(end, start);
+#endif
         ev_ln = layernorm_backward(queue, dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, {ev_mm});
+#if (TIMEPROFILE >= 2)
+        ev_ln.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        ln_ms += get_elapsed_ms(start, end);
+#endif
         ev_last = ev_ln;
     }
+
+#if (TIMEPROFILE >= 2)
+    ev_last.wait();
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     auto ev_enc = encoder_backward(queue, grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C, {ev_last});
+#if (TIMEPROFILE >= 2)
+    ev_enc.wait();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ec_ms += get_elapsed_ms(start, end);
+#endif
+
+#if (TIMEPROFILE >= 2)
+    if (dump_timings) {
+        printf("[BWD] il_ms = %10.3f, cs_ms = %10.3f, mm_ms = %10.3f, ln_ms = %10.3f\n", il_ms, cs_ms, mm_ms, ln_ms);
+        printf("[BWD] rs_ms = %10.3f, gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", rs_ms, gl_ms, at_ms, ec_ms);
+    }
+#endif
+
     return ev_enc;
 }
 
@@ -1774,7 +2004,7 @@ int main() {
             for (int i = 0; i < val_num_batches; i++) {
                 last.wait(); // Wait before loading next batch
                 dataloader_next_batch(&val_loader);
-                last = gpt2_forward(queue, &model, val_loader.inputs, val_loader.targets, B, T, {last});
+                last = gpt2_forward(queue, &model, val_loader.inputs, val_loader.targets, B, T, /* dump_timings = */ false, {last});
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1793,7 +2023,7 @@ int main() {
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
                 last.wait(); // gen_tokens is "inputs" variable required to be available on host
-                last = gpt2_forward(queue, &model, gen_tokens, NULL, B, T, {last});
+                last = gpt2_forward(queue, &model, gen_tokens, NULL, B, T, /* dump_timings = */ false, {last});
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
@@ -1824,16 +2054,52 @@ int main() {
         clock_gettime(CLOCK_MONOTONIC, &start);
 
         dataloader_next_batch(&train_loader);
-        last = gpt2_forward(queue, &model, train_loader.inputs, train_loader.targets, B, T, {last});
+
+#if (TIMEPROFILE >= 1)
+        last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double dataloader_ms = get_elapsed_ms(start, end);
+#endif
+
+        last = gpt2_forward(queue, &model, train_loader.inputs, train_loader.targets, B, T, /* dump_timings = */ true, {last});
+
+#if (TIMEPROFILE >= 1)
+        last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        double gpt2_forward_ms = get_elapsed_ms(end, start);
+#endif
+
         last = gpt2_zero_grad(queue, &model, {last});
-        last = gpt2_backward(queue, &model, {last});
+
+#if (TIMEPROFILE >= 1)
+        last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double gpt2_zero_grad_ms = get_elapsed_ms(start, end);
+#endif
+
+        last = gpt2_backward(queue, &model, /* dump_timings = */ true, {last});
+
+#if (TIMEPROFILE >= 1)
+        last.wait();
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        double gpt2_backward_ms = get_elapsed_ms(end, start);
+#endif
+
         last = gpt2_update(queue, &model, 1e-4, 0.9, 0.999, 1e-8, 0.0, step+1, {last});
 
         last.wait();
         clock_gettime(CLOCK_MONOTONIC, &end);
 
+#if (TIMEPROFILE >= 1)
+        double gpt2_update_ms = get_elapsed_ms(start, end);
+        double total_ms = dataloader_ms + gpt2_forward_ms + gpt2_zero_grad_ms + gpt2_backward_ms + gpt2_update_ms;
+        printf("step %4d: train loss %.6f (took %10.3f ms: [%10.3f, %10.3f, %10.3f, %10.3f, %10.3f])\n", step,
+                model.mean_loss, total_ms, dataloader_ms,
+                gpt2_forward_ms, gpt2_zero_grad_ms, gpt2_backward_ms, gpt2_update_ms);
+#else
         double total_ms = get_elapsed_ms(start, end);
         printf("step %4d: train loss %.6f (took %10.3f ms)\n", step, model.mean_loss, total_ms);
+#endif
 
     }
 
