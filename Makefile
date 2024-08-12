@@ -282,8 +282,8 @@ else
       $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
     else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
-      NVCC_FLAGS += -DMULTI_GPU
-      NVCC_LDLIBS += -lnccl
+      #NVCC_FLAGS += -DMULTI_GPU
+      #NVCC_LDLIBS += -lnccl
     else
       $(info ✗ NCCL is not found, disabling multi-GPU support)
       $(info ---> On Linux you can try install NCCL with `sudo apt install libnccl2 libnccl-dev`)

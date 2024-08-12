@@ -2642,8 +2642,8 @@ int main() {
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    int B = 8; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int T = 1024; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);

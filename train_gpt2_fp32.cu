@@ -1565,10 +1565,10 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
-    int B = 4; // batch size
+    int B = 8; // batch size
     int T = 1024; // sequence length max
-    float learning_rate = 3e-4f;
-    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    float learning_rate = 1e-4f;
+    int val_loss_every = 10; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
@@ -1636,8 +1636,8 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
-    int val_num_batches = val_loader.num_tokens / (B*T);
+    int train_num_batches = 40; //train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+    int val_num_batches = 5; //val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
     printf("| val_num_batches       | %-50d |\n", val_num_batches);

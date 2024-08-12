@@ -8,16 +8,16 @@ local_cache=/export/users/${USER}/cache/stash
 #backend=opencl
 
 # Intel GPUs
-vendor=intel
-device=gpu
-backend=level_zero
-aot=pvc # Optional ahead-of-time (AOT) compilation on Intel GPUs
+#vendor=intel
+#device=gpu
+#backend=level_zero
+#aot=pvc # Optional ahead-of-time (AOT) compilation on Intel GPUs
 
 # NVidia GPUs
-#vendor=nvidia
-#device=gpu
-#backend=cuda
-#aot=a100 #h100 # Compulsory AOT compilation for Nvidia GPUs
+vendor=nvidia
+device=gpu
+backend=cuda
+aot=a100 #h100 # Compulsory AOT compilation for Nvidia GPUs
 
 # Build options, if any
 timeprofile=1 # or 2
@@ -43,13 +43,13 @@ export KMP_AFFINITY=granularity=fine,compact,1,0 # If hyperthreading is on
 ## Source compiler
 # Intel SYCL/DPC++ icpx compiler if running on Intel GPUs
 #compiler_build=20240630_nightly
-compiler_build=20240604_rls
-source $local_cache/oneapi-compiler/$compiler_build/lnx/package/setvars.sh
-icpx -fsycl --version
+#compiler_build=20240604_rls
+#source $local_cache/oneapi-compiler/$compiler_build/lnx/package/setvars.sh
+#icpx -fsycl --version
 # Open-source LLVM clang++ compiler if running on NVidia GPUs
-#compiler_build=nightly-2024-08-07
-#source $local_cache/llvm-oss-compiler/$compiler_build/lnx/cuda/llvm-setvars.sh
-#clang++ -fsycl --version
+compiler_build=nightly-2024-08-07
+source $local_cache/llvm-oss-compiler/$compiler_build/lnx/cuda/llvm-setvars.sh
+clang++ -fsycl --version
 
 echo "All available SYCL devices:"
 sycl-ls
