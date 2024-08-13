@@ -82,6 +82,15 @@ endif
 ifeq ($(SYCL_AOT_COMPILE),h100)
     SYCL_FLAGS += -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90
 endif
+ifeq ($(BUILD_ONEMKL_INTERFACES),yes)
+    SYCL_FLAGS += -DONEMKL_INTERFACES
+    SYCL_INCLUDES += -I$(ONEMKL_ROOT)/include
+    ifeq ($(DEVICE_VENDOR),intel)
+        SYCL_LDLIBS += -L$(ONEMKL_ROOT)/lib -lonemkl -lonemkl_blas_mklgpu
+    else ifeq ($(DEVICE_VENDOR),nvidia)
+        SYCL_LDLIBS += -L$(ONEMKL_ROOT)/lib -lonemkl -lonemkl_blas_cublas
+    endif
+endif
 
 # We will place .o files in the `build` directory (create it if it doesn't exist)
 BUILD_DIR = build

@@ -25,6 +25,10 @@ the GPT-2 model. This is a SYCL port meant to be accelerator-agnostic to
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#ifdef ONEMKL_INTERFACES
+#include "oneapi/mkl/blas.hpp"
+#endif
+
 // Flip comment to print some traces
 //#define ftrace(fmt, ...) printf("%s:%d" fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
 #define ftrace(fmt, ...)
@@ -380,6 +384,51 @@ sycl::event layernorm_backward(sycl::queue &queue, float* dinp, float* dweight, 
 #endif
 }
 
+#ifdef ONEMKL_INTERFACES
+sycl::event matmul_forward_onemkl_interfaces(sycl::queue &queue, float* out,
+                                             const float* inp, const float* weight, const float* bias,
+                                             int B, int T, int C, int OC,
+                                             const std::vector<sycl::event> &dependencies = {})
+{
+    // inp is (B*T, C), weight is (OC, C). Bias is (OC) and is added on separately later.
+    // out is (B*T, OC). All inputs are in row-major format, but apparently
+    // row-major is not supported, so we must flip-around some things to get
+    // what we want with column-major GEMM.
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const oneapi::mkl::transpose opA = oneapi::mkl::transpose::trans;
+    const oneapi::mkl::transpose opB = oneapi::mkl::transpose::nontrans;
+    sycl::event ev_blas_gemm = oneapi::mkl::blas::column_major::gemm(queue, opA, opB,
+            OC, B*T, C, alpha, weight, C, inp, C, beta, out, OC, dependencies);
+
+    // Add in bias:
+    if (bias != NULL) {
+        sycl::event ev_bias = queue.submit([&](sycl::handler &cgh) {
+            cgh.depends_on(ev_blas_gemm);
+            auto kernel = [=](sycl::item<2> item) {
+                const size_t bt = item.get_id(0);
+                const size_t o  = item.get_id(1);
+                out[bt * OC + o] += bias[o];
+            };
+            cgh.parallel_for<class ker_matmul_forward_cublas_bias>(sycl::range<2>(B*T, OC), kernel);
+        });
+        return ev_bias;
+    }
+    else {
+        return ev_blas_gemm;
+    }
+}
+
+sycl::event matmul_forward(sycl::queue &queue, float* out,
+                           const float* inp, const float* weight, const float* bias,
+                           const int B, const int T, const int C, const int OC,
+                           const std::vector<sycl::event> &dependencies = {}) {
+    return matmul_forward_onemkl_interfaces(queue, out, inp, weight, bias, B, T, C, OC, dependencies);
+}
+
+#else // #ifdef ONEMKL_INTERFACES
+
 template <int SG_SIZE>
 class ker_matmul_forward2;
 
@@ -530,6 +579,60 @@ sycl::event matmul_forward(sycl::queue &queue, float* out,
 #endif
     return last;
 }
+#endif // #ifdef ONEMKL_INTERFACES
+
+#ifdef ONEMKL_INTERFACES
+sycl::event matmul_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                                              const float* dout, const float* inp, const float* weight,
+                                              int B, int T, int C, int OC,
+                                              const std::vector<sycl::event> &dependencies = {})
+{
+    // inp is (B*T, C), weight is (OC, C). Bias is (OC) and is added on separately later.
+    // out is (B*T, OC). All inputs are in row-major format, but apparently
+    // row-major is not supported, so we must flip-around some things to get
+    // what we want with column-major GEMM.
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const oneapi::mkl::transpose opNonTrans = oneapi::mkl::transpose::nontrans;
+    const oneapi::mkl::transpose opTrans    = oneapi::mkl::transpose::trans;
+
+    sycl::event ev_dinp = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opNonTrans,
+            C, B*T, OC, alpha, weight, C, dout, OC, beta, dinp, C, dependencies);
+
+    sycl::event ev_dweight = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opTrans,
+            C, OC, B*T, alpha, inp, C, dout, OC, beta, dweight, C, {ev_dinp});
+
+    // backward into bias, parallelize over output channels OC
+    sycl::event ev_dbias = ev_dweight; //sycl::event();
+    if (dbias != NULL) {
+        ev_dbias = queue.submit([&](sycl::handler &cgh) {
+            cgh.depends_on(ev_dweight);
+            auto kernel = [=](sycl::item<1> item) {
+                const size_t o = item.get_id(0);
+                float sum = float(0);
+                for (int bt = 0; bt < B*T; bt++) {
+                    const float* dout_bt = dout + bt * OC;
+                    sum += dout_bt[o];
+                }
+                dbias[o] += sum;
+            };
+            cgh.parallel_for<class ker_matmul_backward_onemkl_interfaces_dbias>(sycl::range<1>(OC), kernel);
+        });
+    }
+
+    return ev_dbias; //queue.ext_oneapi_submit_barrier({ev_dinp, ev_dweight, ev_dbias});
+}
+
+sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
+                            const float* dout, const float* inp, const float* weight,
+                            int B, int T, int C, int OC,
+                            const std::vector<sycl::event> &dependencies = {}) {
+    return matmul_backward_onemkl_interfaces(queue, dinp, dweight, dbias, dout, inp, weight,
+            B, T, C, OC, dependencies);
+}
+
+#else // #ifdef ONEMKL_INTERFACES
 
 template <int SG_SIZE>
 class ker_matmul_backward2_dinp;
@@ -631,6 +734,7 @@ sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, flo
     return matmul_backward2<32>(queue, dinp, dweight, dbias, dout, inp, weight, B, T, C, OC, sg_per_wg, dependencies);
 #endif
 }
+#endif // #ifdef ONEMKL_INTERFACES
 
 template <int SG_SIZE>
 class ker_attention_forward_2;
