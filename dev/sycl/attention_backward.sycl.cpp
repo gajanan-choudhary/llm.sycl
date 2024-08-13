@@ -28,6 +28,14 @@ Observations as of 08/06/2024: version 2 with is faster on CPU device
 #include "common.h"
 #include <sycl/sycl.hpp>
 
+// Turn on manual timings for this particular file since
+// this kernel is just so difficult
+#define GET_TIMINGS
+
+#ifdef ONEMKL_INTERFACES
+#include "oneapi/mkl/blas.hpp"
+#endif
+
 #define SQRT sqrtf
 #define EXP  expf
 
@@ -287,32 +295,40 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
     const int hs = C / NH; // head size
     const float scale = 1.f / SQRT(float(hs));
 
+#ifdef GET_TIMINGS
+    queue.wait();
+    timespec start, e1, e2, e3, e4, e5;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     sycl::event ev_datt = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::item<2> item) {
+        auto kernel = [=](sycl::item<3> item) {
             const size_t b = item.get_id(0);
             const size_t h = item.get_id(1);
-            for (size_t t = 0; t < T; t++) {
+            const size_t t = item.get_id(2);
 
-                const float* dout_bth = dout + b * T * C + t * C + h * hs;
-                float* datt_bth       = datt + b*NH*T*T + h*T*T + t*T;
+            const float* dout_bth = dout + b * T * C + t * C + h * hs;
+            float* datt_bth       = datt + b*NH*T*T + h*T*T + t*T;
 
-                // backward pass 4, through the value accumulation
-                for (int t2 = 0; t2 <= t; t2++) {
-                    const float* value_t2 = inp  + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float datt_val = float(0);
-                    for (int i = 0; i < hs; i++) {
-                        // in the forward pass this was:
-                        // out_bth[i] += att_bth[t2] * value_t2[i];
-                        // so now we have:
-                        datt_val += value_t2[i] * dout_bth[i];
-                    }
-                    datt_bth[t2] += datt_val;
+            // backward pass 4, through the value accumulation
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* value_t2 = inp  + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                float datt_val = float(0);
+                for (int i = 0; i < hs; i++) {
+                    // in the forward pass this was:
+                    // out_bth[i] += att_bth[t2] * value_t2[i];
+                    // so now we have:
+                    datt_val += value_t2[i] * dout_bth[i];
                 }
+                datt_bth[t2] += datt_val;
             }
         };
-        cgh.parallel_for<class ker_attention_backward_2_datt>(sycl::range<2>(B, NH), kernel);
+        cgh.parallel_for<class ker_attention_backward_2_datt>(sycl::range<3>(B, NH, T), kernel);
     });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e1);
+#endif
 
     sycl::event ev_dvalue = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
@@ -337,31 +353,41 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
         };
         cgh.parallel_for<class ker_attention_backward_2_dvalue>(sycl::range<3>(B, NH, hs), kernel);
     });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e2);
+#endif
 
     sycl::event ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on({ev_datt, ev_dvalue});
-        auto kernel = [=](sycl::item<2> item) {
-            const size_t b = item.get_id(0);
-            const size_t h = item.get_id(1);
-            for (size_t t = 0; t < T; t++) {
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t t  = item.get_id(1);
+            const size_t t3 = item.get_id(2);
 
-                const float* att_bth  = att  + b*NH*T*T + h*T*T + t*T;
-                const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+            if (t3 <= t) {
+                const float* att_bth  = att  + bh*T*T + t*T;
+                const float* datt_bth = datt + bh*T*T + t*T;
+                float* dpreatt_bth = dpreatt + bh*T*T + t*T;
 
                 // backward pass 2 & 3, the softmax
                 // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+                float dpreatt_val = float(0);
+                const float att_bth_t3 = att_bth[t3];
                 for (int t2 = 0; t2 <= t; t2++) {
-                    for (int t3 = 0; t3 <= t; t3++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                    }
+                    float indicator = t2 == t3 ? 1.0f : 0.0f;
+                    float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
+                    dpreatt_val += local_derivative * datt_bth[t2];
                 }
+                dpreatt_bth[t3] += dpreatt_val;
             }
         };
-        cgh.parallel_for<class ker_attention_backward_2_dpreatt>(sycl::range<2>(B, NH), kernel);
+        cgh.parallel_for<class ker_attention_backward_2_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e3);
+#endif
 
     sycl::event last = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(ev_dpreatt);
@@ -375,20 +401,33 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
                 const float* query_t     = inp  + b * T * C3 + t * C3 + h * hs;
                 float* dquery_t          = dinp + b * T * C3 + t * C3 + h * hs;
 
+                const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
+                float* dkey_bh      = dinp + b * T * C3 + h * hs + C; // +C because it's key
+
                 // backward pass 1, the query @ key matmul
                 for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = inp  + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    float* dkey_t2      = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                        // in the forward pass this was:
-                        // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                        // so now we have:
-                        dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
-                        dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
+                    const float* key_t2 = key_bh  + t2 * C3;
+                    float* dkey_t2      = dkey_bh + t2 * C3;
+                    // in the forward pass this was:
+                    // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
+                    // so now we have:
+                    dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
+                    dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
                 }
             }
         };
         cgh.parallel_for<class ker_attention_backward_2_dquery_dkey>(sycl::range<3>(B, NH, hs), kernel);
     });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e4);
+
+    double t1_ms = get_elapsed_ms(start, e1);
+    double t2_ms = get_elapsed_ms(e1, e2);
+    double t3_ms = get_elapsed_ms(e2, e3);
+    double t4_ms = get_elapsed_ms(e3, e4);
+    printf("T1 = %.4f ms, T2 = %.4f ms, T3 = %.4f ms, T4 = %.4f ms\n", t1_ms, t2_ms, t3_ms, t4_ms);
+#endif
     return last;
 }
 
@@ -500,6 +539,160 @@ sycl::event attention_backward3(sycl::queue &queue, float* dinp, float* dpreatt,
     return last;
 }
 
+#ifdef ONEMKL_INTERFACES
+sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+                                                 const float* dout, const float* inp, const float* att,
+                                                 const int B, const int T, const int C, const int NH,
+                                                 const std::vector<sycl::event> &dependencies = {}) {
+    // inp/dinp are (B, T, 3C) Q,K,V
+    // att/datt/dpreatt are (B, NH, T, T)
+    // dout is (B, T, C)
+    const int C3 = C*3;
+    const int hs = C / NH; // head size
+    const float scale = 1.f / SQRT(float(hs));
+
+#ifdef GET_TIMINGS
+    queue.wait();
+    timespec start, e1, e2, e3, e4, e5;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+    std::vector<sycl::event> depends_datt_dval(2 * NH);
+    //sycl::event last = queue.ext_oneapi_submit_barrier(dependencies);
+    for (int h = 0; h < NH; h++) {
+        // Many triangular MM operations are performed:
+        //          LOWER(datt) += dout         x (value)^T  :  (T, T)  = (T, hs)  x (T, hs)^T
+        //          dvalue      += LOWER(att)^T x dout       :  (T, hs) = (T, T)^T x (T, hs)
+        // There are B * NH such matrices generated.
+        // Will give incorrect results if upper triangular regions of
+        // att is non-zero. We MUST also then reset the upper triangular region
+        // of datt to their original values to truly respect the "+=" op.
+        // However, we just reset it to zero later.
+        const float* dout_bh = dout + h * hs;
+        const int ldo = C;
+        const float* value = inp + h * hs + C*2; // +C*2 because it's value
+        const int ldv = C3;
+        float* datt_bh = datt + h * T * T;
+        const int lda = T;
+        depends_datt_dval[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_datt_dval[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+        //        T, T, hs, 1.0f, dout_bh, ldo, T * C, value, ldv, T * C3, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
+
+        const float* att_bh = att + h * T * T;
+        //const int lda = T;
+        float* dvalue = dinp + h * hs + C*2; // +C*2 because it's dvalue
+        //const int ldv = C3;
+        depends_datt_dval[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_datt_dval[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, dout_bh, ldo, T * C, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+    }
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e1);
+#endif
+
+    auto ev_datt_correction = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(depends_datt_dval);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh  = item.get_id(0);
+            const size_t row = item.get_id(1);
+            const size_t col = item.get_id(2);
+            if (col > row) datt[bh * T * T + row * T + col] = float(0);
+        };
+        cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_datt_correction>(sycl::range<3>(B * NH, T, T), kernel);
+    });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e2);
+#endif
+
+    auto ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_datt_correction);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t t  = item.get_id(1);
+            const size_t t3 = item.get_id(2);
+
+            if (t3 <= t) {
+                const float* att_bth  = att  + bh*T*T + t*T;
+                const float* datt_bth = datt + bh*T*T + t*T;
+                float* dpreatt_bth = dpreatt + bh*T*T + t*T;
+
+                // backward pass 2 & 3, the softmax
+                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+                float dpreatt_val = float(0);
+                const float att_bth_t3 = att_bth[t3];
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float indicator = t2 == t3 ? 1.0f : 0.0f;
+                    float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
+                    dpreatt_val += local_derivative * datt_bth[t2];
+                }
+                dpreatt_bth[t3] += dpreatt_val;
+            }
+        };
+        cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
+    });
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e3);
+#endif
+
+    std::vector<sycl::event> depends_dquery_dkey(2 * NH);
+    for (int h = 0; h < NH; h++) {
+        // Many triangular MM operations are performed:
+        //          dquery = LOWER(dpreatt)   x key,
+        //          dkey   = LOWER(dpreatt)^T x query
+        // (op'd) Sizes: (T, hs) = (T, T) x (T, hs).
+        // There are B * NH such matrices generated.
+        // Will give incorrect results if upper triangular region of dpreatt is non-zero.
+        const float* dpreatt_bh = dpreatt + h * T * T;
+        const int ldp = T;
+        const float *key = inp + h * hs + C;
+        const int ldk = C3;
+        float *dquery = dinp + h * hs;
+        const int ldq = C3;
+        depends_dquery_dkey[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_dquery_dkey[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+
+        const float *query = inp + h * hs;
+        //const int ldq = C3;
+        float *dkey = dinp + h * hs + C;
+        //const int ldk = C3;
+        depends_dquery_dkey[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_qdp[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+    }
+#ifdef GET_TIMINGS
+    queue.wait();
+    clock_gettime(CLOCK_MONOTONIC, &e4);
+
+    double t1_ms = get_elapsed_ms(start, e1);
+    double t2_ms = get_elapsed_ms(e1, e2);
+    double t3_ms = get_elapsed_ms(e2, e3);
+    double t4_ms = get_elapsed_ms(e3, e4);
+    printf("T1 = %.4f ms, T2 = %.4f ms, T3 = %.4f ms, T4 = %.4f ms\n", t1_ms, t2_ms, t3_ms, t4_ms);
+#endif
+
+    return queue.ext_oneapi_submit_barrier(depends_dquery_dkey);
+}
+#endif
+
 // kernel version dispatch
 sycl::event attention_backward(int kernel_num,
                                sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
@@ -531,6 +724,11 @@ sycl::event attention_backward(int kernel_num,
                 printf("Invalid sg_size\n");
                 exit(2);
             }
+#ifdef ONEMKL_INTERFACES
+        case 4: {
+            return attention_backward_onemkl_interfaces(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH);
+        } break;
+#endif
         } break;
         default: {
             printf("Invalid kernel number\n");
@@ -633,7 +831,7 @@ int main(int argc, char **argv) {
 
     // Test kernels 1, 2
     for (int i = 1; i <= 2; i++) {
-        if (kernel_num == i) {
+        if (/*kernel_num*/2 == i) {
             printf("************************************************.\n");
             printf("Checking kernel set #%i.\n", kernel_num);
             attention_backward(kernel_num, queue, d_dinp, d_dpreatt, d_datt, d_dout, d_inp, d_att, B, T, C, NH, 0, 0);
@@ -690,6 +888,30 @@ int main(int argc, char **argv) {
     }
     if (run_all) kernel_num++;
     printf("\n");
+
+//    if (kernel_num == 4) {
+//        printf("************************************************.\n");
+//        printf("Checking kernel set #%i.\n", kernel_num);
+//        attention_backward(kernel_num, queue, d_dinp, d_dpreatt, d_datt, d_dout, d_inp, d_att, B, T, C, NH, 0, 0);
+//        queue.wait();
+//        validate_result(queue, d_dinp, dinp, "dinp", B * T * 3 * C, 1e-5f);
+//        validate_result(queue, d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-5f);
+//        validate_result(queue, d_datt, datt, "datt", B * NH * T * T, 1e-5f);
+//        printf("All results match. Benchmarking kernel %i.\n", kernel_num);
+//        double elapsed_ms = benchmark_kernel(repeat_times, attention_backward,
+//                                             kernel_num, queue, d_dinp, d_dpreatt, d_datt,
+//                                             d_dout, d_inp, d_att,
+//                                             B, T, C, NH, 0, 0);
+//        double tflops = get_attention_bwd_tflops(elapsed_ms, B, T, C, NH);
+//        printf("kernel %2i | time %.4f ms | tflops %.2f\n", kernel_num, elapsed_ms, tflops);
+//
+//        queue.fill<float>(d_dinp, float(0), B * T * 3 * C);
+//        queue.fill<float>(d_dpreatt, float(0), B * NH * T * T);
+//        queue.fill<float>(d_datt, float(0), B * NH * T * T);
+//        queue.wait();
+//    }
+//    if (run_all) kernel_num++;
+//    printf("\n");
 
     // free memory
     queue.wait_and_throw();
