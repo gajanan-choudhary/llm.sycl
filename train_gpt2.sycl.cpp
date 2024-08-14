@@ -736,6 +736,121 @@ sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, flo
 }
 #endif // #ifdef ONEMKL_INTERFACES
 
+#ifdef ONEMKL_INTERFACES
+sycl::event attention_forward_onemkl_interfaces(sycl::queue &queue, float* out, float* preatt, float* att,
+                                                const float* inp,
+                                                const int B, const int T, const int C, const int NH,
+                                                const std::vector<sycl::event> &dependencies = {}) {
+    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
+    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
+    // that holds the pre-attention and post-attention scores (used in backward)
+    // output is (B, T, C)
+    // attention is the only layer that mixes information across time
+    // every other operation is applied at every (b,t) position independently
+    // (and of course, no layer mixes information across batch)
+    const int C3 = C*3;
+    const int hs = C / NH; // head size
+    const float scale = 1.0 / sqrtf(float(hs));
+
+    std::vector<sycl::event> depends_qdotk(B);
+    for (int b = 0; b < B; b++) {
+        // Many triangular Q x K^T operations are performed.
+        // Sizes: (T, hs) x (hs, T) = (T, T) matrices. There are B * NH such
+        // matrices generated.
+        // Upper triangular region of preatt MUST be separately reset to
+        // -INFINITY later for this to work as intended later.
+        const float *query = inp + b * T * C3;
+        const int ldq = C3;
+        const float *key = query + C;
+        const int ldk = C3;
+        float* preatt_bh = preatt + b*NH*T*T;
+        const int ldp = T;
+        depends_qdotk[b] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                T, T, hs, scale, key, ldk, hs, query, ldq, hs, 0.0, preatt_bh, ldp, T*T, NH, dependencies);
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_qdotk[b] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+        //        T, T, hs, scale, query, ldq, hs, key, ldk, hs, 0.0, preatt_bh, ldp, T*T, NH, dependencies);
+    }
+
+    sycl::event ev_softmax = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(depends_qdotk);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t b  = item.get_id(0);
+            const size_t t  = item.get_id(1);
+            const size_t h  = item.get_id(2);
+
+            float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+            float* att_bth    = att    + b*NH*T*T + h*T*T + t*T;
+
+            // pass 1: calculate query dot key and maxval
+            float maxval = -std::numeric_limits<float>::max();
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float val = preatt_bth[t2];
+                if (val > maxval) {
+                    maxval = val;
+                }
+            }
+            // pad preatt with -INFINITY and att with zero outside of autoregressive
+            // region for keeping BLAS batched GEMM calls valid
+            for (int t2 = t+1; t2 < T; t2++) {
+                preatt_bth[t2] = -INFINITY;
+            }
+
+            // pass 2: calculate the exp and keep track of sum
+            // maxval is being calculated and subtracted only for numerical stability
+            float expsum = float(0);
+            for (int t2 = 0; t2 <= t; t2++) {
+                float expv = EXP(preatt_bth[t2] - maxval);
+                expsum += expv;
+                att_bth[t2] = expv;
+            }
+            float expsum_inv = expsum == float(0) ? float(0) : float(1.0) / expsum;
+
+            // pass 3: normalize to get the softmax
+            // pad att with zero outside of autoregressive
+            // region for keeping BLAS batched GEMM calls valid
+            for (int t2 = 0; t2 < T; t2++) {
+                att_bth[t2] = (t2 <= t ? att_bth[t2] * expsum_inv : float(0));
+            }
+        };
+        cgh.parallel_for<class ker_attention_forward_onemkl_interfaces_softmax_out>(sycl::range<3>(B, T, NH), kernel);
+    });
+
+    std::vector<sycl::event> depends_av(NH);
+    for (int h = 0; h < NH; h++) {
+        // Many triangular att x V operations are performed.
+        // Sizes: (T, T) x (T, hs) = (T, hs) matrices. There are B * NH such
+        // matrices generated.
+        // Upper triangular region of att_bh MUST be preset to 0 earlier for
+        // this to work as intended!
+        const float* att_bh = att + h * T * T;
+        const int lda = T;
+        const float* value = inp + h * hs + C*2; // +C*2 because it's value
+        const int ldv = C3;
+        float* out_bh = out + h * hs;
+        const int ldo = C;
+        depends_av[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                hs, T, T, 1.0, value, ldv, T * C3, att_bh, lda, NH*T*T, 0.0, out_bh, ldo, T * C, B, {ev_softmax});
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_av[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, 1.0, att_bh, lda, NH*T*T, value, ldv, T * C3, 0.0, out_bh, ldo, T * C, B, {ev_softmax});
+    }
+    return queue.ext_oneapi_submit_barrier(depends_av);
+}
+
+sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, float* att,
+                              const float* inp,
+                              const int B, const int T, const int C, const int NH,
+                              const std::vector<sycl::event> &dependencies = {}) {
+    return attention_forward_onemkl_interfaces(queue, out, preatt, att, inp, B, T, C, NH, dependencies);
+}
+
+#else
+
 template <int SG_SIZE>
 class ker_attention_forward_2;
 
@@ -850,19 +965,150 @@ sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, flo
     return attention_forward2<32>(queue, out, preatt, att, inp, B, T, C, NH, sg_per_wg, dependencies);
 #endif
 }
+#endif //#ifdef ONEMKL_INTERFACES
 
-template <int SG_SIZE>
-class ker_attention_backward_3;
+#ifdef ONEMKL_INTERFACES
+sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+                                                 const float* dout, const float* inp, const float* att,
+                                                 const int B, const int T, const int C, const int NH,
+                                                 const std::vector<sycl::event> &dependencies = {}) {
+    // inp/dinp are (B, T, 3C) Q,K,V
+    // att/datt/dpreatt are (B, NH, T, T)
+    // dout is (B, T, C)
+    const int C3 = C*3;
+    const int hs = C / NH; // head size
+    const float scale = 1.f / SQRT(float(hs));
 
-template <typename T>
-using atomic_ref_relaxed = sycl::atomic_ref<T, sycl::memory_order::relaxed,
-                                            sycl::memory_scope::work_group,
-                                            sycl::access::address_space::global_space>;
+    std::vector<sycl::event> depends_datt_dval(2 * NH);
+    //sycl::event last = queue.ext_oneapi_submit_barrier(dependencies);
+    for (int h = 0; h < NH; h++) {
+        // Many triangular MM operations are performed:
+        //          LOWER(datt) += dout         x (value)^T  :  (T, T)  = (T, hs)  x (T, hs)^T
+        //          dvalue      += LOWER(att)^T x dout       :  (T, hs) = (T, T)^T x (T, hs)
+        // There are B * NH such matrices generated.
+        // Will give incorrect results if upper triangular regions of
+        // att is non-zero. We MUST also then reset the upper triangular region
+        // of datt to their original values to truly respect the "+=" op.
+        // However, we just reset it to zero later.
+        const float* dout_bh = dout + h * hs;
+        const int ldo = C;
+        const float* value = inp + h * hs + C*2; // +C*2 because it's value
+        const int ldv = C3;
+        float* datt_bh = datt + h * T * T;
+        const int lda = T;
+        depends_datt_dval[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_datt_dval[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+        //        T, T, hs, 1.0f, dout_bh, ldo, T * C, value, ldv, T * C3, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
 
-template<int SG_SIZE>
-sycl::event attention_backward3(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+        const float* att_bh = att + h * T * T;
+        //const int lda = T;
+        float* dvalue = dinp + h * hs + C*2; // +C*2 because it's dvalue
+        //const int ldv = C3;
+        depends_datt_dval[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_datt_dval[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, dout_bh, ldo, T * C, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+    }
+
+    auto ev_datt_correction = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(depends_datt_dval);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh  = item.get_id(0);
+            const size_t row = item.get_id(1);
+            const size_t col = item.get_id(2);
+            if (col > row) datt[bh * T * T + row * T + col] = float(0);
+        };
+        cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_datt_correction>(sycl::range<3>(B * NH, T, T), kernel);
+    });
+
+    auto ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_datt_correction);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t t  = item.get_id(1);
+            const size_t t3 = item.get_id(2);
+            if (t3 > t) return;
+
+            const float* att_bth  = att  + bh*T*T + t*T;
+            const float* datt_bth = datt + bh*T*T + t*T;
+            float* dpreatt_bth = dpreatt + bh*T*T + t*T;
+
+            // backward pass 2 & 3, the softmax
+            // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+            const float att_bth_t3 = att_bth[t3];
+            float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
+            // This unroll fails on CPU device with incorrectness with Intel
+            // 2024.2 compiler version. It appears to have been fixed in the
+            // upcoming 2025.0 version. Add a work-around for this
+            #if !defined(SYCL_CUDA) && !(defined(SYCL_CPU) && defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER <= 20240200))
+            #pragma unroll
+            #endif
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float local_derivative = -att_bth[t2] * att_bth_t3;
+                dpreatt_val += local_derivative * datt_bth[t2];
+            }
+            dpreatt_bth[t3] += dpreatt_val;
+        };
+        cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
+    });
+
+    std::vector<sycl::event> depends_dquery_dkey(2 * NH);
+    for (int h = 0; h < NH; h++) {
+        // Many triangular MM operations are performed:
+        //          dquery = LOWER(dpreatt)   x key,
+        //          dkey   = LOWER(dpreatt)^T x query
+        // (op'd) Sizes: (T, hs) = (T, T) x (T, hs).
+        // There are B * NH such matrices generated.
+        // Will give incorrect results if upper triangular region of dpreatt is non-zero.
+        const float* dpreatt_bh = dpreatt + h * T * T;
+        const int ldp = T;
+        const float *key = inp + h * hs + C;
+        const int ldk = C3;
+        float *dquery = dinp + h * hs;
+        const int ldq = C3;
+        depends_dquery_dkey[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_dquery_dkey[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+
+        const float *query = inp + h * hs;
+        //const int ldq = C3;
+        float *dkey = dinp + h * hs + C;
+        //const int ldk = C3;
+        depends_dquery_dkey[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+        // row_major gemm_batch apparently not supported in cuBLAS
+        //depends_qdp[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+    }
+
+    return queue.ext_oneapi_submit_barrier(depends_dquery_dkey);
+}
+
+sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
+                               const float* dout, const float* inp, const float* att,
+                               const int B, const int T, const int C, const int NH,
+                               const std::vector<sycl::event> &dependencies = {}) {
+    return attention_backward_onemkl_interfaces(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, dependencies);
+}
+
+#else
+
+sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
                                 const float* dout, const float* inp, const float* att,
-                                const int B, const int T, const int C, const int NH, const int sg_per_wg,
+                                const int B, const int T, const int C, const int NH,
                                 const std::vector<sycl::event> &dependencies = {}) {
     // inp/dinp are (B, T, 3C) Q,K,V
     // att/datt/dpreatt are (B, NH, T, T)
@@ -870,91 +1116,140 @@ sycl::event attention_backward3(sycl::queue &queue, float* dinp, float* dpreatt,
     const int C3 = C*3;
     const int hs = C / NH; // head size
     const float scale = 1.f / SQRT(float(hs));
-    const int adjusted_sg_per_wg = std::min((T + SG_SIZE - 1)/SG_SIZE, sg_per_wg);
-    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+
+    sycl::event ev_datt = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            const size_t b      = item.get_global_id(0);
-            const size_t h      = item.get_global_id(1);
-            const size_t lid    = item.get_local_linear_id();
-            sycl::group gr      = item.get_group();
-            sycl::sub_group sgr = item.get_sub_group();
-            const size_t sg_gid = sgr.get_group_id();
-            const size_t sg_cid = sgr.get_local_id();
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t b = item.get_id(0);
+            const size_t h = item.get_id(1);
+            const size_t t = item.get_id(2);
 
-            for (size_t t = 0; t < T; t++) {
-                const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                float* datt_bth = datt + b*NH*T*T + h*T*T + t*T; // easy parallel
-                float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T; // easy parallel
-                float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs; // easy parallel
-                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+            const float* dout_bth = dout + b * T * C + t * C + h * hs;
+            float* datt_bth       = datt + b*NH*T*T + h*T*T + t*T;
 
-                // backward pass 4, through the value accumulation
-                const float* dout_bth = dout + b * T * C + t * C + h * hs;
-                for (int t2 = sg_gid; t2 <= t; t2+= adjusted_sg_per_wg) {
-                    const float att_bth_t2 = att_bth[t2];
-                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
-                    float datt_val = 0.0f;
-                    for (int i = sg_cid; i < hs; i+=SG_SIZE) {
-                        // in the forward pass this was:
-                        // out_bth[i] += att_bth[t2] * value_t2[i];
-                        // so now we have:
-                        const float dout_bth_i = dout_bth[i];
-                        atomic_ref_relaxed<float> dvalue_t2_atomic(dvalue_t2[i]);
-                        dvalue_t2_atomic.fetch_add(att_bth_t2 * dout_bth_i);
-                        datt_val += value_t2[i] * dout_bth_i;
-                        //datt_val     += value_t2[i] * dout_bth[i];
-                        //dvalue_t2[i] += att_bth[t2] * dout_bth[i];
-                    }
-                    //datt_bth[t2] += datt_val;
-                    datt_val = sycl::reduce_over_group(sgr, datt_val, sycl::plus<float>());
-                    if (sg_cid == 0) datt_bth[t2] += datt_val;
+            // backward pass 4, through the value accumulation
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* value_t2 = inp  + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                float datt_val = float(0);
+                #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+                #pragma unroll
+                #endif
+                for (int i = 0; i < hs; i++) {
+                    // in the forward pass this was:
+                    // out_bth[i] += att_bth[t2] * value_t2[i];
+                    // so now we have:
+                    datt_val += value_t2[i] * dout_bth[i];
                 }
-                sycl::group_barrier(gr);
-
-                // backward pass 2 & 3, the softmax
-                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                for (int t3 = sg_gid; t3 <= t; t3+=adjusted_sg_per_wg) {
-                    const float att_bth_t3  = att_bth[t3];
-                    float dpreatt_val = 0.0f;
-                    for (int t2 = sg_cid; t2 <= t; t2+=SG_SIZE) {
-                        const float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        const float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
-                        dpreatt_val += local_derivative * datt_bth[t2];
-                        //dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                    }
-                    dpreatt_val = sycl::reduce_over_group(sgr, dpreatt_val, sycl::plus<float>());
-                    if (sg_cid == 0) dpreatt_bth[t3] += dpreatt_val;
-                    //atomic_ref_relaxed<float> dpreatt_bth_atomic(dpreatt_bth[t3]);
-                    //dpreatt_bth_atomic.fetch_add(local_derivative * datt_bth[t2]);
-                }
-                sycl::group_barrier(gr);
-
-                // backward pass 1, the query @ key matmul
-                for (int t2 = sg_gid; t2 <= t; t2+=adjusted_sg_per_wg) {
-                    const float scaled_dpreatt_t2 = dpreatt_bth[t2] * scale;
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    for (int i = sg_cid; i < hs; i+=SG_SIZE) {
-                        // in the forward pass this was:
-                        // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                        // so now we have:
-                        atomic_ref_relaxed<float> dquery_t_atomic(dquery_t[i]);
-                        atomic_ref_relaxed<float> dkey_t2_atomic(dkey_t2[i]);
-                        dquery_t_atomic.fetch_add(key_t2[i] * scaled_dpreatt_t2);
-                        dkey_t2_atomic.fetch_add(query_t[i] * scaled_dpreatt_t2);
-                        //dquery_t[i] += key_t2[i] * dpreatt_bth_t2 * scale;
-                        //dkey_t2[i] += query_t[i] * dpreatt_bth_t2 * scale;
-                    }
-                }
-                sycl::group_barrier(gr);
+                datt_bth[t2] += datt_val;
             }
         };
-        cgh.parallel_for<class ker_attention_backward_3<SG_SIZE>>(
-                sycl::nd_range<3>(sycl::range<3>(B, NH, wg_size),
-                                  sycl::range<3>(1, 1, wg_size)), kernel);
+        cgh.parallel_for<class ker_attention_backward_2_datt>(sycl::range<3>(B, NH, T), kernel);
+    });
+
+    sycl::event ev_dvalue = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt2 = item.get_id(0);
+            const size_t b   = bt2 / T;
+            const size_t t2  = bt2 % T;
+            const size_t h = item.get_id(1);
+            const size_t i = item.get_id(2);
+
+            // backward pass 4, through the value accumulation
+            float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
+            float dvalue_t2i = float(0);
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
+            for (size_t t = t2; t < T; t++) {
+                const float* dout_bth = dout + b * T * C + t * C + h * hs;
+                const float* att_bth  = att  + b*NH*T*T + h*T*T + t*T;
+                dvalue_t2i += att_bth[t2] * dout_bth[i];
+            }
+            dvalue_t2[i] += dvalue_t2i;
+        };
+        cgh.parallel_for<class ker_attention_backward_2_dvalue>(sycl::range<3>(B*T, NH, hs), kernel);
+    });
+
+    sycl::event ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on({ev_datt, ev_dvalue});
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t t  = item.get_id(1);
+            const size_t t3 = item.get_id(2);
+            if (t3 > t) return;
+
+            const float* att_bth  = att  + bh*T*T + t*T;
+            const float* datt_bth = datt + bh*T*T + t*T;
+            float* dpreatt_bth = dpreatt + bh*T*T + t*T;
+
+            // backward pass 2 & 3, the softmax
+            // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+            const float att_bth_t3 = att_bth[t3];
+            float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
+            // This unroll fails on CPU device with incorrectness with Intel
+            // 2024.2 compiler version. It appears to have been fixed in the
+            // upcoming 2025.0 version. Add a work-around for this
+            #if !defined(SYCL_CUDA) && !(defined(SYCL_CPU) && defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER <= 20240200))
+            #pragma unroll
+            #endif
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float local_derivative = -att_bth[t2] * att_bth_t3;
+                dpreatt_val += local_derivative * datt_bth[t2];
+            }
+            dpreatt_bth[t3] += dpreatt_val;
+        };
+        cgh.parallel_for<class ker_attention_backward_2_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
+    });
+
+    sycl::event ev_dquery = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_dpreatt);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt = item.get_id(0);
+            const size_t b  = bt / T;
+            const size_t t  = bt % T;
+            const size_t h  = item.get_id(1);
+            const size_t i  = item.get_id(2);
+
+            const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+            float* dquery_t          = dinp + b * T * C3 + t * C3 + h * hs;
+
+            const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
+
+            // backward pass 1, the query @ key matmul
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* key_t2 = key_bh  + t2 * C3;
+                dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
+            }
+        };
+        cgh.parallel_for<class ker_attention_backward_2_dquery>(sycl::range<3>(B*T, NH, hs), kernel);
+    });
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_dquery);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt2 = item.get_id(0);
+            const size_t b   = bt2 / T;
+            const size_t t2  = bt2 % T;
+            const size_t h   = item.get_id(1);
+            const size_t i   = item.get_id(2);
+
+            // backward pass 1, the query @ key matmul
+            float* dkey_t2 = dinp + b * T * C3 + h * hs + t2 * C3 + C; // +C because it's key
+            float dkey_t2i = float(0);
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
+            for (size_t t = t2; t < T; t++) {
+                const float* query_t     = inp + b * T * C3 + t * C3 + h * hs;
+                const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+                dkey_t2i += query_t[i] * dpreatt_bth[t2] * scale;
+            }
+            dkey_t2[i] += dkey_t2i;
+        };
+        cgh.parallel_for<class ker_attention_backward_2_dkey>(sycl::range<3>(B*T, NH, hs), kernel);
     });
     return last;
 }
@@ -963,19 +1258,9 @@ sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, 
                                const float* dout, const float* inp, const float* att,
                                const int B, const int T, const int C, const int NH,
                                const std::vector<sycl::event> &dependencies = {}) {
-#if defined(SYCL_CPU)
-    // This particular attention_backward kernel is actually not too great on
-    // CPU device compared to some other kernels, but fantastic on GPU
-    constexpr int sg_per_wg = 4;
-    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
-#elif defined(SYCL_CUDA)
-    constexpr int sg_per_wg = 32;
-    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
-#else
-    constexpr int sg_per_wg = 32;
-    return attention_backward3<32>(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, sg_per_wg, dependencies);
-#endif
+    return attention_backward2(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, dependencies);
 }
+#endif //#ifdef ONEMKL_INTERFACES
 
 #define GELU_SCALING_FACTOR SQRT(2.0f / M_PI)
 template <int SG_SIZE>
