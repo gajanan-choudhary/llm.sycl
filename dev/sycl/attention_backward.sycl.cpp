@@ -333,25 +333,23 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
     sycl::event ev_dvalue = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(dependencies);
         auto kernel = [=](sycl::item<3> item) {
-            const size_t b = item.get_id(0);
+            const size_t bt2 = item.get_id(0);
+            const size_t b   = bt2 / T;
+            const size_t t2  = bt2 % T;
             const size_t h = item.get_id(1);
             const size_t i = item.get_id(2);
-            for (size_t t = 0; t < T; t++) {
 
+            // backward pass 4, through the value accumulation
+            float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
+            float dvalue_t2i = float(0);
+            for (size_t t = t2; t < T; t++) {
                 const float* dout_bth = dout + b * T * C + t * C + h * hs;
                 const float* att_bth  = att  + b*NH*T*T + h*T*T + t*T;
-
-                // backward pass 4, through the value accumulation
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
-                    // in the forward pass this was:
-                    // out_bth[i] += att_bth[t2] * value_t2[i];
-                    // so now we have:
-                    dvalue_t2[i] += att_bth[t2] * dout_bth[i];
-                }
+                dvalue_t2i += att_bth[t2] * dout_bth[i];
             }
+            dvalue_t2[i] += dvalue_t2i;
         };
-        cgh.parallel_for<class ker_attention_backward_2_dvalue>(sycl::range<3>(B, NH, hs), kernel);
+        cgh.parallel_for<class ker_attention_backward_2_dvalue>(sycl::range<3>(B*T, NH, hs), kernel);
     });
 #ifdef GET_TIMINGS
     queue.wait();
@@ -389,34 +387,48 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
     clock_gettime(CLOCK_MONOTONIC, &e3);
 #endif
 
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+    sycl::event ev_dquery = queue.submit([&](sycl::handler &cgh) {
         cgh.depends_on(ev_dpreatt);
         auto kernel = [=](sycl::item<3> item) {
-            const size_t b = item.get_id(0);
-            const size_t h = item.get_id(1);
-            const size_t i = item.get_id(2);
-            for (size_t t = 0; t < T; t++) {
+            const size_t bt = item.get_id(0);
+            const size_t b  = bt / T;
+            const size_t t  = bt % T;
+            const size_t h  = item.get_id(1);
+            const size_t i  = item.get_id(2);
 
-                const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                const float* query_t     = inp  + b * T * C3 + t * C3 + h * hs;
-                float* dquery_t          = dinp + b * T * C3 + t * C3 + h * hs;
+            const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+            float* dquery_t          = dinp + b * T * C3 + t * C3 + h * hs;
 
-                const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
-                float* dkey_bh      = dinp + b * T * C3 + h * hs + C; // +C because it's key
+            const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
 
-                // backward pass 1, the query @ key matmul
-                for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = key_bh  + t2 * C3;
-                    float* dkey_t2      = dkey_bh + t2 * C3;
-                    // in the forward pass this was:
-                    // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                    // so now we have:
-                    dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
-                    dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
-                }
+            // backward pass 1, the query @ key matmul
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float* key_t2 = key_bh  + t2 * C3;
+                dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
             }
         };
-        cgh.parallel_for<class ker_attention_backward_2_dquery_dkey>(sycl::range<3>(B, NH, hs), kernel);
+        cgh.parallel_for<class ker_attention_backward_2_dquery>(sycl::range<3>(B*T, NH, hs), kernel);
+    });
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_dquery);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt2 = item.get_id(0);
+            const size_t b   = bt2 / T;
+            const size_t t2  = bt2 % T;
+            const size_t h   = item.get_id(1);
+            const size_t i   = item.get_id(2);
+
+            // backward pass 1, the query @ key matmul
+            float* dkey_t2 = dinp + b * T * C3 + h * hs + t2 * C3 + C; // +C because it's key
+            float dkey_t2i = float(0);
+            for (size_t t = t2; t < T; t++) {
+                const float* query_t     = inp + b * T * C3 + t * C3 + h * hs;
+                const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+                dkey_t2i += query_t[i] * dpreatt_bth[t2] * scale;
+            }
+            dkey_t2[i] += dkey_t2i;
+        };
+        cgh.parallel_for<class ker_attention_backward_2_dkey>(sycl::range<3>(B*T, NH, hs), kernel);
     });
 #ifdef GET_TIMINGS
     queue.wait();
@@ -831,7 +843,8 @@ int main(int argc, char **argv) {
 
     // Test kernels 1, 2
     for (int i = 1; i <= 2; i++) {
-        if (/*kernel_num*/2 == i) {
+        if (kernel_num == 1 && run_all) {kernel_num++; continue;} // Skip for now since it is super slow
+        if (kernel_num == i) {
             printf("************************************************.\n");
             printf("Checking kernel set #%i.\n", kernel_num);
             attention_backward(kernel_num, queue, d_dinp, d_dpreatt, d_datt, d_dout, d_inp, d_att, B, T, C, NH, 0, 0);
@@ -889,29 +902,29 @@ int main(int argc, char **argv) {
     if (run_all) kernel_num++;
     printf("\n");
 
-//    if (kernel_num == 4) {
-//        printf("************************************************.\n");
-//        printf("Checking kernel set #%i.\n", kernel_num);
-//        attention_backward(kernel_num, queue, d_dinp, d_dpreatt, d_datt, d_dout, d_inp, d_att, B, T, C, NH, 0, 0);
-//        queue.wait();
-//        validate_result(queue, d_dinp, dinp, "dinp", B * T * 3 * C, 1e-5f);
-//        validate_result(queue, d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-5f);
-//        validate_result(queue, d_datt, datt, "datt", B * NH * T * T, 1e-5f);
-//        printf("All results match. Benchmarking kernel %i.\n", kernel_num);
-//        double elapsed_ms = benchmark_kernel(repeat_times, attention_backward,
-//                                             kernel_num, queue, d_dinp, d_dpreatt, d_datt,
-//                                             d_dout, d_inp, d_att,
-//                                             B, T, C, NH, 0, 0);
-//        double tflops = get_attention_bwd_tflops(elapsed_ms, B, T, C, NH);
-//        printf("kernel %2i | time %.4f ms | tflops %.2f\n", kernel_num, elapsed_ms, tflops);
-//
-//        queue.fill<float>(d_dinp, float(0), B * T * 3 * C);
-//        queue.fill<float>(d_dpreatt, float(0), B * NH * T * T);
-//        queue.fill<float>(d_datt, float(0), B * NH * T * T);
-//        queue.wait();
-//    }
-//    if (run_all) kernel_num++;
-//    printf("\n");
+    if (kernel_num == 4) {
+        printf("************************************************.\n");
+        printf("Checking kernel set #%i.\n", kernel_num);
+        attention_backward(kernel_num, queue, d_dinp, d_dpreatt, d_datt, d_dout, d_inp, d_att, B, T, C, NH, 0, 0);
+        queue.wait();
+        validate_result(queue, d_dinp, dinp, "dinp", B * T * 3 * C, 1e-5f);
+        validate_result(queue, d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-5f);
+        validate_result(queue, d_datt, datt, "datt", B * NH * T * T, 1e-5f);
+        printf("All results match. Benchmarking kernel %i.\n", kernel_num);
+        double elapsed_ms = benchmark_kernel(repeat_times, attention_backward,
+                                             kernel_num, queue, d_dinp, d_dpreatt, d_datt,
+                                             d_dout, d_inp, d_att,
+                                             B, T, C, NH, 0, 0);
+        double tflops = get_attention_bwd_tflops(elapsed_ms, B, T, C, NH);
+        printf("kernel %2i | time %.4f ms | tflops %.2f\n", kernel_num, elapsed_ms, tflops);
+
+        queue.fill<float>(d_dinp, float(0), B * T * 3 * C);
+        queue.fill<float>(d_dpreatt, float(0), B * NH * T * T);
+        queue.fill<float>(d_datt, float(0), B * NH * T * T);
+        queue.wait();
+    }
+    if (run_all) kernel_num++;
+    printf("\n");
 
     // free memory
     queue.wait_and_throw();
