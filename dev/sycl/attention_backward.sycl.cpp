@@ -314,6 +314,9 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             for (int t2 = 0; t2 <= t; t2++) {
                 const float* value_t2 = inp  + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                 float datt_val = float(0);
+                #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+                #pragma unroll
+                #endif
                 for (int i = 0; i < hs; i++) {
                     // in the forward pass this was:
                     // out_bth[i] += att_bth[t2] * value_t2[i];
@@ -342,6 +345,9 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             // backward pass 4, through the value accumulation
             float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
             float dvalue_t2i = float(0);
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
             for (size_t t = t2; t < T; t++) {
                 const float* dout_bth = dout + b * T * C + t * C + h * hs;
                 const float* att_bth  = att  + b*NH*T*T + h*T*T + t*T;
@@ -362,23 +368,24 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             const size_t bh = item.get_id(0);
             const size_t t  = item.get_id(1);
             const size_t t3 = item.get_id(2);
+            if (t3 > t) return;
 
-            if (t3 <= t) {
-                const float* att_bth  = att  + bh*T*T + t*T;
-                const float* datt_bth = datt + bh*T*T + t*T;
-                float* dpreatt_bth = dpreatt + bh*T*T + t*T;
+            const float* att_bth  = att  + bh*T*T + t*T;
+            const float* datt_bth = datt + bh*T*T + t*T;
+            float* dpreatt_bth = dpreatt + bh*T*T + t*T;
 
-                // backward pass 2 & 3, the softmax
-                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                float dpreatt_val = float(0);
-                const float att_bth_t3 = att_bth[t3];
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float indicator = t2 == t3 ? 1.0f : 0.0f;
-                    float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
-                    dpreatt_val += local_derivative * datt_bth[t2];
-                }
-                dpreatt_bth[t3] += dpreatt_val;
+            // backward pass 2 & 3, the softmax
+            // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+            const float att_bth_t3 = att_bth[t3];
+            float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float local_derivative = -att_bth[t2] * att_bth_t3;
+                dpreatt_val += local_derivative * datt_bth[t2];
             }
+            dpreatt_bth[t3] += dpreatt_val;
         };
         cgh.parallel_for<class ker_attention_backward_2_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
@@ -402,6 +409,9 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
 
             // backward pass 1, the query @ key matmul
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
             for (int t2 = 0; t2 <= t; t2++) {
                 const float* key_t2 = key_bh  + t2 * C3;
                 dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
@@ -421,6 +431,9 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             // backward pass 1, the query @ key matmul
             float* dkey_t2 = dinp + b * T * C3 + h * hs + t2 * C3 + C; // +C because it's key
             float dkey_t2i = float(0);
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
             for (size_t t = t2; t < T; t++) {
                 const float* query_t     = inp + b * T * C3 + t * C3 + h * hs;
                 const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
@@ -631,23 +644,24 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
             const size_t bh = item.get_id(0);
             const size_t t  = item.get_id(1);
             const size_t t3 = item.get_id(2);
+            if (t3 > t) return;
 
-            if (t3 <= t) {
-                const float* att_bth  = att  + bh*T*T + t*T;
-                const float* datt_bth = datt + bh*T*T + t*T;
-                float* dpreatt_bth = dpreatt + bh*T*T + t*T;
+            const float* att_bth  = att  + bh*T*T + t*T;
+            const float* datt_bth = datt + bh*T*T + t*T;
+            float* dpreatt_bth = dpreatt + bh*T*T + t*T;
 
-                // backward pass 2 & 3, the softmax
-                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                float dpreatt_val = float(0);
-                const float att_bth_t3 = att_bth[t3];
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float indicator = t2 == t3 ? 1.0f : 0.0f;
-                    float local_derivative = att_bth[t2] * (indicator - att_bth_t3);
-                    dpreatt_val += local_derivative * datt_bth[t2];
-                }
-                dpreatt_bth[t3] += dpreatt_val;
+            // backward pass 2 & 3, the softmax
+            // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+            const float att_bth_t3 = att_bth[t3];
+            float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
+            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            #pragma unroll
+            #endif
+            for (int t2 = 0; t2 <= t; t2++) {
+                const float local_derivative = -att_bth[t2] * att_bth_t3;
+                dpreatt_val += local_derivative * datt_bth[t2];
             }
+            dpreatt_bth[t3] += dpreatt_val;
         };
         cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
