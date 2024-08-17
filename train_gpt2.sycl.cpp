@@ -25,6 +25,10 @@ the GPT-2 model. This is a SYCL port meant to be accelerator-agnostic to
 #include <sycl/sycl.hpp>
 #include <vector>
 
+// Flip comment to print some traces
+//#define ftrace(fmt, ...) printf("%s:%d" fmt "\n", __func__, __LINE__, ##__VA_ARGS__);
+#define ftrace(fmt, ...)
+
 #define SQRT sqrtf /* sycl::sqrt */
 #define FABS fabsf /* sycl::fabs */
 #define EXP  expf  /* sycl::exp  */
@@ -101,6 +105,7 @@ sycl::event encoder_forward(sycl::queue &queue, float* out,
                             const int* inp, const float* wte, const float* wpe,
                             const int B, const int T, const int C,
                             const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 32;
     return encoder_forward2<32>(queue, out, inp, wte, wpe, B, T, C, sg_per_wg, dependencies);
@@ -180,6 +185,7 @@ sycl::event encoder_backward(sycl::queue &queue, float* dwte, float* dwpe,
                              const float* dout, const int* inp,
                              const int B, const int T, const int C,
                              const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 2;
     return encoder_backward3<16>(queue, dwte, dwpe, dout, inp, B, T, C, sg_per_wg, dependencies);
@@ -253,6 +259,7 @@ sycl::event layernorm_forward(sycl::queue &queue, float* out, float* mean, float
                               const float* inp, const float* weight, const float* bias,
                               const int B, const int T, const int C,
                               const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 2;
     return layernorm_forward2<16>(queue, out, mean, rstd, inp, weight, bias, B, T, C, sg_per_wg, dependencies);
@@ -360,6 +367,7 @@ sycl::event layernorm_backward(sycl::queue &queue, float* dinp, float* dweight, 
                                float* dout, float* inp, float* weight, float* mean, float* rstd,
                                const int B, const int T, const int C,
                                const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 2;
     return layernorm_backward2<16>(queue, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, sg_per_wg, dependencies);
@@ -434,6 +442,7 @@ sycl::event matmul_forward(sycl::queue &queue, float* out,
     // make sure the tiled loop will be correct or fallback to naive version
     constexpr int LOOP_UNROLL = 8;
     //if (B*T % LOOP_UNROLL != 0) {
+    ftrace();
 #if defined(SYCL_CPU)
         // sg_size = 32 had bad performance on CPU device
         constexpr int sg_per_wg = 4;
@@ -609,6 +618,7 @@ sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, flo
                             const float* dout, const float* inp, const float* weight,
                             int B, int T, int C, int OC,
                             const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     // sg_size = 32 had bad performance on CPU device
     constexpr int sg_per_wg = 1;
@@ -723,6 +733,7 @@ sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, flo
                               const float* inp,
                               const int B, const int T, const int C, const int NH,
                               const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     // sg_size = 32 had bad performance on CPU device
     constexpr int sg_per_wg = 2;
@@ -892,6 +903,7 @@ sycl::event gelu_forward2(sycl::queue &queue, float* out,
 sycl::event gelu_forward(sycl::queue &queue, float* out,
                          const float* inp, const int N,
                          const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 128;
     return gelu_forward2<16>(queue, out, inp, N, sg_per_wg, dependencies);
@@ -945,6 +957,7 @@ sycl::event gelu_backward2(sycl::queue &queue, float* dinp,
 sycl::event gelu_backward(sycl::queue &queue, float* dinp,
                           const float* inp, const float* dout, const int N,
                           const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return gelu_backward2<16>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
@@ -983,6 +996,7 @@ sycl::event residual_forward2(sycl::queue &queue, float* out,
 sycl::event residual_forward(sycl::queue &queue, float* dinp,
                              const float* inp, const float* dout, const int N,
                              const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return residual_forward2<16>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
@@ -1025,6 +1039,7 @@ sycl::event residual_backward2(sycl::queue &queue, float* dinp1, float* dinp2,
 sycl::event residual_backward(sycl::queue &queue, float* dinp1, float* dinp2,
                               const float* dout, const int N,
                               const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return residual_backward2<16>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
@@ -1097,6 +1112,7 @@ sycl::event online_softmax_forward2(sycl::queue &queue, float* probs, const floa
 sycl::event softmax_forward(sycl::queue &queue, float* probs, float* logits,
                             const int B, const int T, const int V, const int Vp,
                             const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return online_softmax_forward2<32>(queue, probs, logits, B, T, V, Vp, sg_per_wg, dependencies);
@@ -1141,6 +1157,7 @@ sycl::event crossentropy_forward(sycl::queue &queue, float* losses,
                                  const float* probs, const int* targets,
                                  const int B, const int T, const int Vp,
                                  const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return crossentropy_forward2<16>(queue, losses, probs, targets, B, T, Vp, sg_per_wg, dependencies);
@@ -1193,6 +1210,7 @@ sycl::event crossentropy_softmax_backward(sycl::queue &queue, float* dlogits,
                                           const float* dlosses, const float* probs, const int* targets,
                                           const size_t B, const size_t T, const size_t V, const size_t Vp,
                                           const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 8;
     return crossentropy_softmax_backward4<32>(queue, dlogits, dlosses, probs, targets, B, T, V, Vp, sg_per_wg, dependencies);
@@ -1255,6 +1273,7 @@ sycl::event adamw(sycl::queue &queue,
                   float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, const int t, const size_t num_parameters,
                   const float learning_rate, const float beta1, const float beta2, const float eps, const float weight_decay,
                   const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 #if defined(SYCL_CPU)
     constexpr int sg_per_wg = 64;
     return adamw2<16>(queue, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
@@ -1329,6 +1348,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(sycl::queue &queue, ParameterTensors* params, size_t* param_sizes) {
+    ftrace();
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
@@ -1377,6 +1397,7 @@ typedef struct {
 } ActivationTensors;
 
 float* malloc_and_point_activations(sycl::queue &queue, ActivationTensors* acts, size_t* act_sizes) {
+    ftrace();
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
@@ -1426,6 +1447,7 @@ typedef struct {
 } GPT2;
 
 void gpt2_build_from_checkpoint(sycl::queue &queue, GPT2 *model, const char* checkpoint_path) {
+    ftrace();
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
@@ -1492,6 +1514,7 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
                          const bool dump_timings,
                          const std::vector<sycl::event> &dependencies = {}) {
     // targets are optional and could be NULL
+    ftrace();
 
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
@@ -1775,6 +1798,7 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
 
 sycl::event gpt2_zero_grad(sycl::queue &queue, GPT2 *model,
                            const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
     std::vector<sycl::event> depends = dependencies;
     if(model->grads_memory != NULL) {
         auto ev_zero_grads_memory = queue.fill<float>(model->grads_memory, 0.0f, model->num_parameters, dependencies);
@@ -1790,6 +1814,7 @@ sycl::event gpt2_zero_grad(sycl::queue &queue, GPT2 *model,
 sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
                           const bool dump_timings,
                           const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -2025,6 +2050,7 @@ sycl::event gpt2_update(sycl::queue &queue, GPT2 *model,
                         const float eps, const float weight_decay, const int t,
                         const std::vector<sycl::event> &dependencies = {})
 {
+    ftrace();
     std::vector<sycl::event> depends = dependencies;
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
