@@ -979,8 +979,8 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
     const int hs = C / NH; // head size
     const float scale = 1.f / SQRT(float(hs));
 
-    std::vector<sycl::event> depends_datt_dval(2 * NH);
-    //sycl::event last = queue.ext_oneapi_submit_barrier(dependencies);
+    sycl::event ev_datt = queue.ext_oneapi_submit_barrier(dependencies);
+    sycl::event ev_dval = ev_datt;
     for (int h = 0; h < NH; h++) {
         // Many triangular MM operations are performed:
         //          LOWER(datt) += dout         x (value)^T  :  (T, T)  = (T, hs)  x (T, hs)^T
@@ -996,29 +996,29 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         const int ldv = C3;
         float* datt_bh = datt + h * T * T;
         const int lda = T;
-        depends_datt_dval[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+        ev_datt = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
+                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 1.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
         // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_datt_dval[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //ev_datt = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-        //        T, T, hs, 1.0f, dout_bh, ldo, T * C, value, ldv, T * C3, 1.0f, datt_bh, lda, NH*T*T, B, dependencies);
+        //        T, T, hs, 1.0f, dout_bh, ldo, T * C, value, ldv, T * C3, 1.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
 
         const float* att_bh = att + h * T * T;
         //const int lda = T;
         float* dvalue = dinp + h * hs + C*2; // +C*2 because it's dvalue
         //const int ldv = C3;
-        depends_datt_dval[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+        ev_dval = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 1.0f, dvalue, ldv, T * C3, B, {ev_dval});
         // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_datt_dval[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //ev_dval = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, dout_bh, ldo, T * C, 1.0f, dvalue, ldv, T * C3, B, dependencies);
+        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, dout_bh, ldo, T * C, 1.0f, dvalue, ldv, T * C3, B, {ev_dval});
     }
 
     auto ev_datt_correction = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(depends_datt_dval);
+        cgh.depends_on({ev_datt, ev_dval});
         auto kernel = [=](sycl::item<3> item) {
             const size_t bh  = item.get_id(0);
             const size_t row = item.get_id(1);
@@ -1059,7 +1059,7 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
 
-    std::vector<sycl::event> depends_dquery_dkey(2 * NH);
+    sycl::event last = ev_dpreatt;
     for (int h = 0; h < NH; h++) {
         // Many triangular MM operations are performed:
         //          dquery = LOWER(dpreatt)   x key,
@@ -1073,28 +1073,28 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         const int ldk = C3;
         float *dquery = dinp + h * hs;
         const int ldq = C3;
-        depends_dquery_dkey[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+        last = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dquery, ldq, T*C3, B, {last});
         // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_dquery_dkey[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0, dquery, ldq, T*C3, B, {ev_dpreatt});
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0, dquery, ldq, T*C3, B, {last});
 
         const float *query = inp + h * hs;
         //const int ldq = C3;
         float *dkey = dinp + h * hs + C;
         //const int ldk = C3;
-        depends_dquery_dkey[h + NH] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+        last = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dkey, ldk, T*C3, B, {last});
         // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_qdp[h + NH] = oneapi::mkl::blas::row_major::gemm_batch(queue,
+        //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0, dkey, ldk, T*C3, B, {ev_dpreatt});
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0, dkey, ldk, T*C3, B, {last});
     }
 
-    return queue.ext_oneapi_submit_barrier(depends_dquery_dkey);
+    return last;
 }
 
 sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
