@@ -59,11 +59,20 @@ This is the hardest part of the entire repository, have patience!
   users to figure out. In the worst case, standalone tests would run a bit
   slower.
 
-## Standalone kernels for experiments
-Once the prerequisites are set up, running the standalone kernels placed in
-[dev/sycl](dev/sycl) directory should be easy. Modify and use the
-run script, [`dev/sycl/run.sh`](dev/sycl/run.sh), to compile and run the
-standalone kernels in that directory. Here's how to modify the run script:
+## Quick start
+
+Follow
+[karpathy/llm.c/blob/master/README.md#quick-start-cpu](https://github.com/karpathy/llm.c/blob/master/README.md#quick-start-cpu)
+to set up the training/testing datasets once by running:
+```sh
+chmod u+x ./dev/download_starter_pack.sh
+./dev/download_starter_pack.sh
+```
+
+Once the prerequisites are set up, the rest should be easy. Modify and use the
+run script, [`run.sh`](run.sh), to compile the GPT-2 FP32 SYCL code,
+[`train_gpt2.sycl.cpp`](train_gpt2.sycl.cpp), into a binary and run it. Here's
+how to modify the run script:
 * At the top of the file, there are some CPU/GPU devices listed as:
   ```sh
   # CPUs
@@ -90,17 +99,14 @@ standalone kernels in that directory. Here's how to modify the run script:
   environment. Otherwise, (e.g., if you have built DPC++-LLVM on Nvidia from
   scratch, for instance,) set up the correct `$PATH`/`$LD_LIBRARY_PATH`
   variables to point to the compiler.
+* The last few lines of the script are to build and run
+  [`train_gpt2.sycl.cpp`](train_gpt2.sycl.cpp) and
+  [`test_gpt2.sycl.cpp`](test_gpt2.sycl.cpp) to run both training and
+  testing. Modify those based on what you want to achieve.
 
-The last few lines of the script have the `make ... run_all` command that
-both builds and runs all the standalone kernels, which should take some
-time to run since there are many kernels and that are repeatedly run to
-benchmark their performance. You can build and run individual files by
-replacing `run_all` with the file name without the `.sycl.cpp` extension.
-For example, for building and running only `matmul_forward.sycl.cpp`,
-replace `run_all` with `run_matmul_forward`. You should see an output like:
+That's it. Running the script should give you an output like:
 
 ```sh
-$ ./run.sh
 clang version 19.0.0git (https://github.com/intel/llvm.git 44c34c14326a189f719fbbe3393a8ee4a790f1c2)
 Target: x86_64-unknown-linux-gnu
 Thread model: posix
@@ -109,84 +115,53 @@ Build config: +assertions
 All available SYCL devices:
 [cuda:gpu][cuda:0] NVIDIA CUDA BACKEND, NVIDIA H100 PCIe 9.0 [CUDA 12.6]
 <------------- Truncated ------------->
-clang++ -O3 -fsycl -fno-sycl-id-queries-fit-in-int -std=c++17 -DLLMSYCL -march=native -ffp-model=precise -DSYCL_CUDA -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90 -D_DISABLE_SG_SIZE_8 -D_DISABLE_SG_SIZE_16   matmul_forward.sycl.cpp -lsycl -lOpenCL -o matmul_forward
-========================================
-Running matmul_forward...
-========================================
-./matmul_forward
-Device maximum workgroup size = 1024
-Device sub_group sizes = [32, ]
-Running reference CPU kernel.
-kernel ref OMP | time 71455.3197 ms | tflops 0.00
-************************************************.
-Checking kernel set #1.
+clang++ -O3 -fsycl -fno-sycl-id-queries-fit-in-int -std=c++17 -DLLMSYCL -march=native -ffp-model=precise -DTIMEPROFILE=1 -DSYCL_CUDA -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90   train_gpt2.sycl.cpp -lsycl -lOpenCL -o train_gpt2sycl
+clang++ -O3 -fsycl -fno-sycl-id-queries-fit-in-int -std=c++17 -DLLMSYCL -march=native -ffp-model=precise -DTIMEPROFILE=1 -DSYCL_CUDA -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_90   test_gpt2.sycl.cpp -lsycl -lOpenCL -o test_gpt2sycl
+Submit training run: train_gp2sycl
+[GPT-2]
+max_seq_len: 1024
+vocab_size: 50257
+padded_vocab_size: 50304
+num_layers: 12
+num_heads: 12
+channels: 768
+num_parameters: 124475904
+train dataset num_batches: 1192
+val dataset num_batches: 128
+num_activations: 73347840
+val loss 5.325533
+step    0: train loss 4.677785 (took     79.346 ms: [     0.008,     19.071,      0.009,     57.550,      2.707])
+step    1: train loss 5.191640 (took     77.752 ms: [     0.010,     18.821,      0.409,     56.571,      1.941])
+step    2: train loss 4.438737 (took     77.963 ms: [     0.007,     19.029,      0.464,     56.519,      1.944])
 <------------- Truncated ------------->
-All results match. Benchmarking kernel 1.
-kernel  1 | time 416.1700 ms | tflops 0.37
+step   19: train loss 4.552019 (took     77.882 ms: [     0.005,     18.797,      0.401,     56.736,      1.943])
+val loss 4.329034
+generating:
+---
 
-************************************************.
-Checking kernel set #2.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 2.
-kernel  2 | time 110.0388 ms | tflops 1.41
+I am Franklin in this world.
+My brother and father drow an ear off the prince.
+Our enemy, my brother and father,
+Were the great Duke of the same age?
 
-************************************************.
-Checking kernel set #3.
-Testing sg_size = 32
-Checking kernel 3<1, 32>.
+<|endoftext|>PUMAS:
+And then we are in peace, shrine on shrine.
+As close as cattle can
+---
+step   20: train loss 4.527010 (took     78.513 ms: [     0.006,     18.964,      0.401,     57.201,      1.941])
 <------------- Truncated ------------->
-All results match. Benchmarking kernel 3<1, 32>.
-kernel  3< 1, 32> | time 76.5156 ms | tflops 2.02
-Checking kernel 3<2, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 3<2, 32>.
-kernel  3< 2, 32> | time 44.1589 ms | tflops 3.50
-Checking kernel 3<4, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 3<4, 32>.
-kernel  3< 4, 32> | time 40.9060 ms | tflops 3.78
-Checking kernel 3<8, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 3<8, 32>.
-kernel  3< 8, 32> | time 40.5502 ms | tflops 3.81
-Checking kernel 3<16, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 3<16, 32>.
-kernel  3<16, 32> | time 41.6397 ms | tflops 3.71
-Checking kernel 3<32, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 3<32, 32>.
-kernel  3<32, 32> | time 42.2843 ms | tflops 3.66
-
-
-************************************************.
-Checking kernel set #4.
-Testing sg_size = 32
-Checking kernel 4<1, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<1, 32>.
-kernel  4< 1, 32> | time 399.2595 ms | tflops 0.39
-Checking kernel 4<2, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<2, 32>.
-kernel  4< 2, 32> | time 399.2614 ms | tflops 0.39
-Checking kernel 4<4, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<4, 32>.
-kernel  4< 4, 32> | time 399.2663 ms | tflops 0.39
-Checking kernel 4<8, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<8, 32>.
-kernel  4< 8, 32> | time 399.2618 ms | tflops 0.39
-Checking kernel 4<16, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<16, 32>.
-kernel  4<16, 32> | time 399.2625 ms | tflops 0.39
-Checking kernel 4<32, 32>.
-<------------- Truncated ------------->
-All results match. Benchmarking kernel 4<32, 32>.
-kernel  4<32, 32> | time 399.2624 ms | tflops 0.39
 ```
+
+## Standalone kernels for experiments
+* The [`dev/sycl`](dev/sycl) directory contains many standalone kernels and
+  a [`run.sh`](dev/sycl/run.sh) script similar to the one in the root directory,
+  that can be modified and run similarly as explained above. At the end of the
+  script is the `make ... run_all` command that both builds and runs all tests,
+  which should take some time. Target individual tests by replacing `run_all`
+  with the file name without the `.sycl.cpp` extension. For example, for
+  building and running only `matmul_forward.sycl.cpp`, replace `run_all` with
+  `run_matmul_forward`. See [`dev/sycl/README.md`](dev/sycl/README.md) for
+  sample output.
 
 ## License
 
