@@ -378,7 +378,10 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
             // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
             const float att_bth_t3 = att_bth[t3];
             float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
-            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            // This unroll fails on CPU device with incorrectness with Intel
+            // 2024.2 compiler version. It appears to have been fixed in the
+            // upcoming 2025.0 version. Add a work-around for this
+            #if !defined(SYCL_CUDA) && !(defined(SYCL_CPU) && defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER <= 20240200))
             #pragma unroll
             #endif
             for (int t2 = 0; t2 <= t; t2++) {
@@ -654,7 +657,10 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
             // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
             const float att_bth_t3 = att_bth[t3];
             float dpreatt_val = att_bth_t3 * datt_bth[t3]; // adjustment for t2 == t3 case below
-            #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
+            // This unroll fails on CPU device with incorrectness with Intel
+            // 2024.2 compiler version. It appears to have been fixed in the
+            // upcoming 2025.0 version. Add a work-around for this
+            #if !defined(SYCL_CUDA) && !(defined(SYCL_CPU) && defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER <= 20240200))
             #pragma unroll
             #endif
             for (int t2 = 0; t2 <= t; t2++) {
