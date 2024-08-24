@@ -106,7 +106,7 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, NULL, B, T);
+    gpt2_forward(&model, x, NULL, B, T, /* dump_timings = */ false);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
@@ -142,9 +142,9 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, y, B, T);
+        gpt2_forward(&model, x, y, B, T, /* dump_timings = */ false);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_backward(&model, /* dump_timings = */ false);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 

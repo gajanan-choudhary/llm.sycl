@@ -33,6 +33,11 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+// Helper for collecting timing info in milliseconds
+inline double get_elapsed_ms(struct timespec &start, struct timespec &end) {
+    return 1e3*((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9);
+}
+
 // ----------------------------------------------------------------------------
 // CUDA utils
 
@@ -1169,7 +1174,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, const bool dump_timings) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1222,15 +1227,28 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     // copy inputs/targets to the model
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    }
+
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    struct timespec start, end;
+    // Variables for tracking wall-clock timings
+    double rl_ms = 0.0, cs_ms = 0.0, mm_ms = 0.0, ln_ms = 0.0;
+    double rs_ms = 0.0, ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
+#endif
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
+#if (TIMEPROFILE >= 2)
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ec_ms += get_elapsed_ms(start, end);
+#endif
 
     for (int l = 0; l < L; l++) {
 
@@ -1271,39 +1289,130 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* scratch = acts.output;
 
         // now do the forward pass
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        ln_ms += get_elapsed_ms(start, end);
+#endif
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        at_ms += get_elapsed_ms(start, end);
+#endif
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        mm_ms += get_elapsed_ms(end, start);
+#endif
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rs_ms += get_elapsed_ms(start, end);
+#endif
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        gl_ms += get_elapsed_ms(end, start);
+#endif
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        rs_ms += get_elapsed_ms(end, start);
+#endif
     }
-
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ln_ms += get_elapsed_ms(start, end);
+#endif
     matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    mm_ms += get_elapsed_ms(end, start);
+#endif
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        cs_ms += get_elapsed_ms(start, end);
+#endif
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
+#if (TIMEPROFILE >= 2)
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
         mean_loss /= B*T;
         model->mean_loss = mean_loss;
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rl_ms += get_elapsed_ms(start, end);
+#endif
 
     } else {
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
     }
+#if (TIMEPROFILE >= 2)
+    if (dump_timings) {
+        printf("[FWD] rl_ms = %10.3f, cs_ms = %10.3f, mm_ms = %10.3f, ln_ms = %10.3f\n", rl_ms, cs_ms, mm_ms, ln_ms);
+        printf("[FWD] rs_ms = %10.3f, gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", rs_ms, gl_ms, at_ms, ec_ms);
+    }
+#endif
 }
 
 void gpt2_zero_grad(GPT2 *model) {
@@ -1311,13 +1420,21 @@ void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, const bool dump_timings) {
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
         exit(EXIT_FAILURE);
     }
+
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    struct timespec start, end;
+    // Variables for tracking wall-clock timings
+    double il_ms = 0.0, cs_ms = 0.0, mm_ms = 0.0, ln_ms = 0.0;
+    double ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
+#endif
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -1338,7 +1455,17 @@ void gpt2_backward(GPT2 *model) {
         }
         printf("allocated %zu MiB for activation gradients\n", (model->num_grad_acts * sizeof(float)) >> 20);
         // init gradients of parameters and activations to zero
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         gpt2_zero_grad(model);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double zg_ms = get_elapsed_ms(start, end);
+        printf("zg_ms = %10.3f\n", zg_ms);
+#endif
     }
 
     // convenience shortcuts
@@ -1360,11 +1487,31 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    il_ms += get_elapsed_ms(start, end);
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    cs_ms += get_elapsed_ms(end, start);
+#endif
     matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    mm_ms += get_elapsed_ms(start, end);
+#endif
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    ln_ms += get_elapsed_ms(end, start);
+#endif
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -1417,22 +1564,82 @@ void gpt2_backward(GPT2 *model) {
         float* scratch = acts.output;
 
         // backprop this layer
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        gl_ms += get_elapsed_ms(end, start);
+#endif
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        at_ms += get_elapsed_ms(end, start);
+#endif
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
+#endif
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+#if (TIMEPROFILE >= 2)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
+#endif
     }
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+#if (TIMEPROFILE >= 2)
+    cudaCheck(cudaDeviceSynchronize());
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    ec_ms += get_elapsed_ms(start, end);
+#endif
+
+#if (TIMEPROFILE >= 2)
+    if (dump_timings) {
+        printf("[BWD] il_ms = %10.3f, cs_ms = %10.3f, mm_ms = %10.3f, ln_ms = %10.3f\n", il_ms, cs_ms, mm_ms, ln_ms);
+        printf("[BWD]                     gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", gl_ms, at_ms, ec_ms);
+    }
+#endif
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
@@ -1675,7 +1882,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T, /* dump_timings = */ false);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1696,7 +1903,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, /* dump_timings = */ false);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1727,18 +1934,48 @@ int main(int argc, char *argv[]) {
         if (last_step) { break; }
 
         // do a training step
+        cudaCheck(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+#if (TIMEPROFILE >= 1)
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double dataloader_ms = get_elapsed_ms(start, end);
+#endif
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, /* dump_timings = */ true);
+#if (TIMEPROFILE >= 1)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        double gpt2_forward_ms = get_elapsed_ms(end, start);
+#endif
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+#if (TIMEPROFILE >= 1)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double gpt2_zero_grad_ms = get_elapsed_ms(start, end);
+#endif
+        gpt2_backward(&model, /* dump_timings = */ true);
+#if (TIMEPROFILE >= 1)
+        cudaCheck(cudaDeviceSynchronize());
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        double gpt2_backward_ms = get_elapsed_ms(end, start);
+#endif
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        total_sum_iteration_time_s += time_elapsed_s;
-        int tokens_per_second = (B * T) / time_elapsed_s;
-        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
+#if (TIMEPROFILE >= 1)
+        double gpt2_update_ms = get_elapsed_ms(start, end);
+        double total_ms = dataloader_ms + gpt2_forward_ms + gpt2_zero_grad_ms + gpt2_backward_ms + gpt2_update_ms;
+        total_sum_iteration_time_s += total_ms/1000.0;
+        int tokens_per_second = (B * T) / total_ms * 1000;
+        printf("step %4d: train loss %.6f (took %10.3f ms: [%10.3f, %10.3f, %10.3f, %10.3f, %10.3f], %d tok/s)\n", step,
+                model.mean_loss, total_ms, dataloader_ms,
+                gpt2_forward_ms, gpt2_zero_grad_ms, gpt2_backward_ms, gpt2_update_ms, tokens_per_second);
+#else
+        double total_ms = get_elapsed_ms(start, end);
+        total_sum_iteration_time_s += total_ms/1000.0;
+        int tokens_per_second = (B * T) / total_ms * 1000;
+        printf("step %4d: train loss %.6f (took %10.3f ms, %d tok/s)\n", step, model.mean_loss, total_ms, tokens_per_second);
+#endif
         logger_log_train(&logger, step, model.mean_loss);
     }
     // add a total average, for optimizations that are only mild improvements

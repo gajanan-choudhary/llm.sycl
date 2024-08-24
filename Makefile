@@ -60,6 +60,7 @@ else ifeq ($(notdir $(SYCLCC)),clang++)
 endif
 ifneq ($(TIME_PROFILE),)
     SYCL_FLAGS += -DTIMEPROFILE=$(TIME_PROFILE)
+    NVCC_FLAGS += -DTIMEPROFILE=$(TIME_PROFILE)
 endif
 ifneq ($(DEVICE),gpu)
     SYCL_LDLIBS += -ltbb
