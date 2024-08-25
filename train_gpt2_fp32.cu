@@ -1179,11 +1179,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // convenience parameters
-    int V = model->config.vocab_size;
-    int Vp = model->config.padded_vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    size_t V = model->config.vocab_size;
+    size_t Vp = model->config.padded_vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -1342,12 +1342,12 @@ void gpt2_backward(GPT2 *model) {
     }
 
     // convenience shortcuts
-    int B = model->batch_size;
-    int T = model->seq_len;
-    int Vp = model->config.padded_vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    size_t B = model->batch_size;
+    size_t T = model->seq_len;
+    size_t Vp = model->config.padded_vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
