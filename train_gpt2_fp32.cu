@@ -1491,15 +1491,19 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
 int sample_softmax(const float* logits, int n, float coin) {
     // sample index from logits (converted to probabilities using softmax)
     // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
+    float maxval = -FLT_MAX;
     for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
+        maxval = maxval > logits[i] ? maxval : logits[i];
+    }
+    float norm = 0;
+    for (int i = 0; i < n; i++) {
+        norm += expf(logits[i] - maxval);
     }
     // instead of dividing all exp(logits), we can just multiply coin.
     coin *= norm;
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
+        cdf += expf(logits[i] - maxval);
         if (coin < cdf) {
             return i;
         }
@@ -1683,7 +1687,7 @@ int main(int argc, char *argv[]) {
         if (step > 0 && step % sample_every == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
+                gen_tokens[i] = tokenizer.eot_token;
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
