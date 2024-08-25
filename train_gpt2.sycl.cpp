@@ -582,6 +582,9 @@ sycl::event matmul_forward(sycl::queue &queue, float* out,
 #endif // #ifdef ONEMKL_INTERFACES
 
 #ifdef ONEMKL_INTERFACES
+template <int SG_SIZE>
+class ker_matmul_backward2_dbias;
+
 sycl::event matmul_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dweight, float* dbias,
                                               const float* dout, const float* inp, const float* weight,
                                               int B, int T, int C, int OC,
@@ -606,18 +609,32 @@ sycl::event matmul_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, f
     // backward into bias, parallelize over output channels OC
     sycl::event ev_dbias = ev_dweight; //sycl::event();
     if (dbias != NULL) {
+        constexpr int SG_SIZE = 32;
+        const size_t max_workgroup_size = std::max<size_t>(1024, queue.get_device().get_info<sycl::info::device::max_work_group_size>());
+        const size_t sg_per_wg = max_workgroup_size / SG_SIZE;
+        const size_t ceilOC = (OC + sg_per_wg - 1) & (-sg_per_wg);
         ev_dbias = queue.submit([&](sycl::handler &cgh) {
             cgh.depends_on(ev_dweight);
-            auto kernel = [=](sycl::item<1> item) {
-                const size_t o = item.get_id(0);
+            auto kernel = [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(SG_SIZE)]] {
+                const size_t o            = item.get_global_id(0);
+                const sycl::sub_group sgr = item.get_sub_group();
+                const size_t sgr_cid      = sgr.get_local_id();
+                if (o >= OC) return;
                 float sum = float(0);
-                for (int bt = 0; bt < B*T; bt++) {
-                    const float* dout_bt = dout + bt * OC;
-                    sum += dout_bt[o];
+                for (int bt = sgr_cid; bt < B*T; bt += SG_SIZE) {
+                    sum += dout[bt * OC + o];
                 }
-                dbias[o] += sum;
+                // Reduce values in each sub_group to sgr_cid == 0
+                sum = sycl::reduce_over_group(sgr, sum, sycl::plus<float>());
+                // For unknown reason, this reduction is failing on CPU device
+                //for (std::uint8_t j = SG_SIZE >> 1; j > 0; j >>= 1) {
+                //    sum += sycl::shift_group_left(sgr, sum, j);
+                //}
+                if (sgr_cid == 0) dbias[o] += sum;
             };
-            cgh.parallel_for<class ker_matmul_backward_onemkl_interfaces_dbias>(sycl::range<1>(OC), kernel);
+            cgh.parallel_for<class ker_matmul_backward2_dbias<SG_SIZE>>(
+                    sycl::nd_range<2>(sycl::range<2>(ceilOC, SG_SIZE),
+                                      sycl::range<2>(sg_per_wg, SG_SIZE)), kernel);
         });
     }
 
@@ -736,9 +753,142 @@ sycl::event matmul_backward(sycl::queue &queue, float* dinp, float* dweight, flo
 }
 #endif // #ifdef ONEMKL_INTERFACES
 
+template <int SG_SIZE>
+class ker_online_softmax_autoregressive_forward_2;
+
+template<int SG_SIZE>
+sycl::event online_softmax_autoregressive_forward2(sycl::queue &queue, float* probs, const float* logits,
+                                                   const size_t BS, const size_t T, const size_t ld, const int sg_per_wg,
+                                                   const std::vector<sycl::event> &dependencies = {}) {
+    // Possibly we must force a power-of-2 sg_per_wg instead of adjusting it
+    // for reduction loops to work as expected.
+    const int adjusted_sg_per_wg = std::min<size_t>((T + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
+    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
+    if (ld < T) throw std::runtime_error("Invalid leading dimension in autoregressive softmax");
+
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const size_t bs  = item.get_global_id(0);
+            const size_t t   = item.get_global_id(1);
+            const size_t lid = item.get_local_linear_id();
+            sycl::group gr   = item.get_group();
+
+            // probs <- softmax(logits)
+            const float* logits_bt = logits + bs * T * ld + t * ld;
+            float* probs_bt        = probs + bs * T * ld + t * ld;
+
+            // maxval is only calculated and subtracted for numerical stability
+            float local_maxval=-std::numeric_limits<float>::max();
+            float local_sum = 0.0f;
+            for (int i = lid; i <= t; i += wg_size) {
+                if (logits_bt[i] > local_maxval) {
+                    local_sum = local_sum * EXP(local_maxval - logits_bt[i]) + 1.0f;
+                    local_maxval = logits_bt[i];
+                }
+                else {
+                    local_sum += EXP(logits_bt[i] - local_maxval);
+                }
+            }
+            // Perform local reduction within a sub_group
+            const float maxval = sycl::reduce_over_group(gr, local_maxval, sycl::maximum<float>());
+            local_sum         *= (maxval > local_maxval ? EXP(local_maxval - maxval) : 1.0f);
+            const float sum    = sycl::reduce_over_group(gr, local_sum, sycl::plus<float>());
+
+            // note we only loop to diagonal
+            for (int i = lid; i <= t; i += wg_size) {
+                probs_bt[i] = EXP(logits_bt[i] - maxval) / sum;
+            }
+
+            // Set remaining triangular region to 0, needed in attention kernels
+            for (int i = t + 1 + lid; i < T; i += wg_size) {
+                probs_bt[i] = 0.0f;
+            }
+        };
+        cgh.parallel_for<class ker_online_softmax_autoregressive_forward_2<SG_SIZE>>(
+                sycl::nd_range<3>(sycl::range<3>(BS, T, wg_size), sycl::range<3>(1, 1, wg_size)), kernel);
+    });
+    return last;
+}
+
+sycl::event softmax_autoregressive_forward(sycl::queue &queue, float* probs, float* logits,
+                                           const size_t BS, const size_t T, const size_t ld,
+                                           const std::vector<sycl::event> &dependencies = {}) {
+    ftrace();
+#if defined(SYCL_CPU)
+    constexpr int sg_per_wg = 8;
+    return online_softmax_autoregressive_forward2<32>(queue, probs, logits, BS, T, ld, sg_per_wg, dependencies);
+#elif defined(SYCL_CUDA)
+    constexpr int sg_per_wg = 32;
+    return online_softmax_autoregressive_forward2<32>(queue, probs, logits, BS, T, ld, sg_per_wg, dependencies);
+#else
+    constexpr int sg_per_wg = 32;
+    return online_softmax_autoregressive_forward2<32>(queue, probs, logits, BS, T, ld, sg_per_wg, dependencies);
+#endif
+}
+
 #ifdef ONEMKL_INTERFACES
+sycl::event permute_forward(sycl::queue &queue, float* qkvr, const float* qkv,
+                            const size_t B, const size_t T, const size_t C, const size_t NH,
+                            const std::vector<sycl::event> &dependencies = {}) {
+    const int C3 = C*3;
+    const int HS = C / NH; // head size
+    // Permute qkv:(B, T, 3, NH, HS) to qkvr:(3, B, NH, T, HS)
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t b  = bh / NH;
+            const size_t h  = bh % NH;
+            const size_t t  = item.get_id(1);
+            const size_t i  = item.get_id(2);
+
+            float *q_out = qkvr  + bh * T * HS + t * HS;
+            float *k_out = q_out + 1 * B * NH * T * HS;
+            float *v_out = q_out + 2 * B * NH * T * HS;
+
+            const float *q_in = qkv  + (b * T * C3) + (t * C3) + h * HS;
+            const float *k_in = q_in + 1 * C;
+            const float *v_in = q_in + 2 * C;
+
+            // q_out[0][b][t][h][i] = q_in[b][0][h][t][i]
+            q_out[i] = q_in[i];
+            k_out[i] = k_in[i];
+            v_out[i] = v_in[i];
+        };
+        cgh.parallel_for<class ker_permute_forward>(sycl::range<3>(B*NH, T, HS), kernel);
+    });
+    return last;
+}
+
+sycl::event unpermute_forward(sycl::queue &queue, float* out, const float* inp,
+                              const size_t B, const size_t T, const size_t C, const size_t NH,
+                              const std::vector<sycl::event> &dependencies = {}) {
+    const int C3 = C*3;
+    const int HS = C / NH; // head size
+    // Permute inp:(B, NH, T, HS) to out:(B, T, C)
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt = item.get_id(0);
+            const size_t b  = bt / T;
+            const size_t t  = bt % T;
+            const size_t h  = item.get_id(1);
+            const size_t i  = item.get_id(2);
+
+            float *out_       = out + bt * NH * HS + h * HS;
+            const float *inp_ = inp + (b * NH * T * HS) + (h * T * HS) + t * HS;
+
+            // out[b][t][h][i] = inp[b][h][t][i]
+            out_[i] = inp_[i];
+        };
+        cgh.parallel_for<class ker_unpermute_forward>(sycl::range<3>(B*T, NH, HS), kernel);
+    });
+    return last;
+}
+
 sycl::event attention_forward_onemkl_interfaces(sycl::queue &queue, float* out, float* preatt, float* att,
-                                                const float* inp,
+                                                float* qkvr, float* inp_scratch,
                                                 const int B, const int T, const int C, const int NH,
                                                 const std::vector<sycl::event> &dependencies = {}) {
     // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
@@ -752,101 +902,34 @@ sycl::event attention_forward_onemkl_interfaces(sycl::queue &queue, float* out, 
     const int hs = C / NH; // head size
     const float scale = 1.0 / sqrtf(float(hs));
 
-    std::vector<sycl::event> depends_qdotk(B);
-    for (int b = 0; b < B; b++) {
-        // Many triangular Q x K^T operations are performed.
-        // Sizes: (T, hs) x (hs, T) = (T, T) matrices. There are B * NH such
-        // matrices generated.
-        // Upper triangular region of preatt MUST be separately reset to
-        // -INFINITY later for this to work as intended later.
-        const float *query = inp + b * T * C3;
-        const int ldq = C3;
-        const float *key = query + C;
-        const int ldk = C3;
-        float* preatt_bh = preatt + b*NH*T*T;
-        const int ldp = T;
-        depends_qdotk[b] = oneapi::mkl::blas::column_major::gemm_batch(queue,
-                oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-                T, T, hs, scale, key, ldk, hs, query, ldq, hs, 0.0f, preatt_bh, ldp, T*T, NH, dependencies);
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_qdotk[b] = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-        //        T, T, hs, scale, query, ldq, hs, key, ldk, hs, 0.0f, preatt_bh, ldp, T*T, NH, dependencies);
-    }
+    // Reorder QKV horizontally (T dimension unchanged):
+    // From B*(Tx3*C), i.e., QKVQKV...QKV to 3*Tx(B*C), i.e., QKV
+    sycl::event ev_permute_forward = permute_forward(queue, qkvr, inp_scratch, B, T, C, NH, dependencies);
+    float *q = qkvr + 0 * B * T * C;
+    float *k = qkvr + 1 * B * T * C;
+    float *v = qkvr + 2 * B * T * C;
 
-    sycl::event ev_softmax = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(depends_qdotk);
-        auto kernel = [=](sycl::item<3> item) {
-            const size_t b  = item.get_id(0);
-            const size_t t  = item.get_id(1);
-            const size_t h  = item.get_id(2);
+    sycl::event ev_qdotk = oneapi::mkl::blas::column_major::gemm_batch(queue,
+            oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+            T, T, hs, scale, k, hs, T*hs, q, hs, T*hs, 0.0f, preatt, T, T*T, B*NH, {ev_permute_forward});
 
-            float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-            float* att_bth    = att    + b*NH*T*T + h*T*T + t*T;
+    sycl::event ev_softmax = softmax_autoregressive_forward(queue, att, preatt, B*NH, T, T, {ev_qdotk});
 
-            // pass 1: calculate query dot key and maxval
-            float maxval = -std::numeric_limits<float>::max();
-            for (int t2 = 0; t2 <= t; t2++) {
-                const float val = preatt_bth[t2];
-                if (val > maxval) {
-                    maxval = val;
-                }
-            }
-            // pad preatt with -INFINITY and att with zero outside of autoregressive
-            // region for keeping BLAS batched GEMM calls valid
-            for (int t2 = t+1; t2 < T; t2++) {
-                preatt_bth[t2] = -INFINITY;
-            }
-
-            // pass 2: calculate the exp and keep track of sum
-            // maxval is being calculated and subtracted only for numerical stability
-            float expsum = float(0);
-            for (int t2 = 0; t2 <= t; t2++) {
-                float expv = EXP(preatt_bth[t2] - maxval);
-                expsum += expv;
-                att_bth[t2] = expv;
-            }
-            float expsum_inv = expsum == float(0) ? float(0) : float(1.0) / expsum;
-
-            // pass 3: normalize to get the softmax
-            // pad att with zero outside of autoregressive
-            // region for keeping BLAS batched GEMM calls valid
-            for (int t2 = 0; t2 < T; t2++) {
-                att_bth[t2] = (t2 <= t ? att_bth[t2] * expsum_inv : float(0));
-            }
-        };
-        cgh.parallel_for<class ker_attention_forward_onemkl_interfaces_softmax_out>(sycl::range<3>(B, T, NH), kernel);
-    });
-
-    std::vector<sycl::event> depends_av(NH);
-    for (int h = 0; h < NH; h++) {
-        // Many triangular att x V operations are performed.
-        // Sizes: (T, T) x (T, hs) = (T, hs) matrices. There are B * NH such
-        // matrices generated.
-        // Upper triangular region of att_bh MUST be preset to 0 earlier for
-        // this to work as intended!
-        const float* att_bh = att + h * T * T;
-        const int lda = T;
-        const float* value = inp + h * hs + C*2; // +C*2 because it's value
-        const int ldv = C3;
-        float* out_bh = out + h * hs;
-        const int ldo = C;
-        depends_av[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
+    // Reuse inp_scratch as it won't be needed after this function
+    sycl::event ev_av = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                hs, T, T, 1.0f, value, ldv, T * C3, att_bh, lda, NH*T*T, 0.0f, out_bh, ldo, T * C, B, {ev_softmax});
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //depends_av[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, value, ldv, T * C3, 0.0f, out_bh, ldo, T * C, B, {ev_softmax});
-    }
-    return queue.ext_oneapi_submit_barrier(depends_av);
+                hs, T, T, 1.0f, v, hs, T * hs, att, T, T*T, 0.0f, inp_scratch, hs, T * hs, B*NH, {ev_softmax});
+
+    sycl::event last = unpermute_forward(queue, out, inp_scratch, B, T, C, NH, {ev_av});
+
+    return last;
 }
 
 sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, float* att,
-                              const float* inp,
+                              float* qkvr, float* inp_scratch,
                               const int B, const int T, const int C, const int NH,
                               const std::vector<sycl::event> &dependencies = {}) {
-    return attention_forward_onemkl_interfaces(queue, out, preatt, att, inp, B, T, C, NH, dependencies);
+    return attention_forward_onemkl_interfaces(queue, out, preatt, att, qkvr, inp_scratch, B, T, C, NH, dependencies);
 }
 
 #else
@@ -968,8 +1051,66 @@ sycl::event attention_forward(sycl::queue &queue, float* out, float* preatt, flo
 #endif //#ifdef ONEMKL_INTERFACES
 
 #ifdef ONEMKL_INTERFACES
+sycl::event permute_backward(sycl::queue &queue, float* dqkv, const float* dqkvr,
+                             const size_t B, const size_t T, const size_t C, const size_t NH,
+                             const std::vector<sycl::event> &dependencies = {}) {
+    const int C3 = C*3;
+    const int HS = C / NH; // head size
+    // Permute dqkvr:(3, B, NH, T, HS) to qkv:(B, T, 3, NH, HS)
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bh = item.get_id(0);
+            const size_t b  = bh / NH;
+            const size_t h  = bh % NH;
+            const size_t t  = item.get_id(1);
+            const size_t i  = item.get_id(2);
+
+            const float *dq_in = dqkvr + bh * T * HS + t * HS;
+            const float *dk_in = dq_in + 1 * B * NH * T * HS;
+            const float *dv_in = dq_in + 2 * B * NH * T * HS;
+
+            float *dq_out = dqkv   + (b * T * C3) + (t * C3) + h * HS;
+            float *dk_out = dq_out + 1 * C;
+            float *dv_out = dq_out + 2 * C;
+
+            // dq_out[b][0][h][t][i] = dq_in[0][b][t][h][i]
+            dq_out[i] = dq_in[i];
+            dk_out[i] = dk_in[i];
+            dv_out[i] = dv_in[i];
+        };
+        cgh.parallel_for<class ker_permute_backward>(sycl::range<3>(B*NH, T, HS), kernel);
+    });
+    return last;
+}
+
+sycl::event unpermute_backward(sycl::queue &queue, float* dinp, const float* dout,
+                               const size_t B, const size_t T, const size_t C, const size_t NH,
+                               const std::vector<sycl::event> &dependencies = {}) {
+    const int HS = C / NH; // head size
+    // Permute dout:(B, T, C) to dinp:(B, NH, T, HS)
+    sycl::event last = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(dependencies);
+        auto kernel = [=](sycl::item<3> item) {
+            const size_t bt = item.get_id(0);
+            const size_t b  = bt / T;
+            const size_t t  = bt % T;
+            const size_t h  = item.get_id(1);
+            const size_t i  = item.get_id(2);
+
+            const float *dout_ = dout + bt * NH * HS + h * HS;
+            float *dinp_       = dinp + (b * NH * T * HS) + (h * T * HS) + t * HS;
+
+            // dinp[b][h][t][i] = dout[b][t][h][i]
+            dinp_[i] = dout_[i];
+        };
+        cgh.parallel_for<class ker_unpermute_backward>(sycl::range<3>(B*T, NH, HS), kernel);
+    });
+    return last;
+}
+
 sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
-                                                 const float* dout, const float* inp, const float* att,
+                                                 float* dscratch, const float* dout, const float* inp, const float* att,
                                                  const int B, const int T, const int C, const int NH,
                                                  const std::vector<sycl::event> &dependencies = {}) {
     // inp/dinp are (B, T, 3C) Q,K,V
@@ -979,57 +1120,35 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
     const int hs = C / NH; // head size
     const float scale = 1.f / SQRT(float(hs));
 
-    sycl::event ev_datt = queue.ext_oneapi_submit_barrier(dependencies);
-    sycl::event ev_dval = ev_datt;
-    for (int h = 0; h < NH; h++) {
-        // Many triangular MM operations are performed:
-        //          LOWER(datt) += dout         x (value)^T  :  (T, T)  = (T, hs)  x (T, hs)^T
-        //          dvalue      += LOWER(att)^T x dout       :  (T, hs) = (T, T)^T x (T, hs)
-        // There are B * NH such matrices generated.
-        // Will give incorrect results if upper triangular regions of
-        // att is non-zero. We MUST also then reset the upper triangular region
-        // of datt to their original values to truly respect the "+=" op.
-        // However, we just reset it to zero later.
-        const float* dout_bh = dout + h * hs;
-        const int ldo = C;
-        const float* value = inp + h * hs + C*2; // +C*2 because it's value
-        const int ldv = C3;
-        float* datt_bh = datt + h * T * T;
-        const int lda = T;
-        ev_datt = oneapi::mkl::blas::column_major::gemm_batch(queue,
-                oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 0.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //ev_datt = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-        //        T, T, hs, 1.0f, dout_bh, ldo, T * C, value, ldv, T * C3, 1.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
+    const float *query = inp + 0 * B * T * C;
+    const float *key   = inp + 1 * B * T * C;
+    const float *value = inp + 2 * B * T * C;
 
-        const float* att_bh = att + h * T * T;
-        //const int lda = T;
-        float* dvalue = dinp + h * hs + C*2; // +C*2 because it's dvalue
-        //const int ldv = C3;
-        ev_dval = oneapi::mkl::blas::column_major::gemm_batch(queue,
-                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 0.0f, dvalue, ldv, T * C3, B, {ev_dval});
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //ev_dval = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, dout_bh, ldo, T * C, 1.0f, dvalue, ldv, T * C3, B, {ev_dval});
-    }
+    // Scratch is BTC + BTC + BTC + BTC in space; The 2nd, 3rd, 4th ones are
+    // reordered dQ, dK, dV. permuted dout and dQ and dK overlap, dV doesnt.
+	float *dqkvr = dscratch + B * NH * T * hs;
+    float *dquery = dqkvr + 0 * B * T * C;
+    float *dkey   = dqkvr + 1 * B * T * C;
+    float *dvalue = dqkvr + 2 * B * T * C;
 
-    auto ev_datt_correction = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on({ev_datt, ev_dval});
-        auto kernel = [=](sycl::item<3> item) {
-            const size_t bh  = item.get_id(0);
-            const size_t row = item.get_id(1);
-            const size_t col = item.get_id(2);
-            if (col > row) datt[bh * T * T + row * T + col] = float(0);
-        };
-        cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_datt_correction>(sycl::range<3>(B * NH, T, T), kernel);
-    });
+    sycl::event ev_perm_dout = unpermute_backward(queue, dscratch, dout, B, T, C, NH, dependencies);
 
-    auto ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(ev_datt_correction);
+    // Many triangular MM operations are to be performed:
+    //          LOWER(datt) += dout         x (value)^T  :  (T, T)  = (T, hs)  x (T, hs)^T
+    //          dvalue      += LOWER(att)^T x dout       :  (T, hs) = (T, T)^T x (T, hs)
+    // There are B * NH such matrices generated.
+    // Normally will give incorrect results if upper triangular regions of
+    // att is non-zero. However, invalid values of att remain unused
+    sycl::event ev_datt = oneapi::mkl::blas::column_major::gemm_batch(queue,
+            oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+            T, T, hs, 1.0f, value, hs, T * hs, dscratch, hs, T * hs, 0.0f, datt, T, T*T, B * NH, {ev_perm_dout});
+
+    sycl::event ev_dvalue = oneapi::mkl::blas::column_major::gemm_batch(queue,
+            oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+            hs, T, T, 1.0f, dscratch, hs, T * hs, att, T, T*T, 0.0f, dvalue, hs, T * hs, B * NH, {ev_perm_dout});
+
+    sycl::event ev_dpreatt = queue.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ev_datt);
         auto kernel = [=](sycl::item<3> item) {
             const size_t bh = item.get_id(0);
             const size_t t  = item.get_id(1);
@@ -1059,49 +1178,26 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
 
-    sycl::event last = ev_dpreatt;
-    for (int h = 0; h < NH; h++) {
-        // Many triangular MM operations are performed:
-        //          dquery = LOWER(dpreatt)   x key,
-        //          dkey   = LOWER(dpreatt)^T x query
-        // (op'd) Sizes: (T, hs) = (T, T) x (T, hs).
-        // There are B * NH such matrices generated.
-        // Will give incorrect results if upper triangular region of dpreatt is non-zero.
-        const float* dpreatt_bh = dpreatt + h * T * T;
-        const int ldp = T;
-        const float *key = inp + h * hs + C;
-        const int ldk = C3;
-        float *dquery = dinp + h * hs;
-        const int ldq = C3;
-        last = oneapi::mkl::blas::column_major::gemm_batch(queue,
-                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0f, dquery, ldq, T*C3, B, {last});
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0f, dquery, ldq, T*C3, B, {last});
+    sycl::event ev_dquery = oneapi::mkl::blas::column_major::gemm_batch(queue,
+            oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+            hs, T, T, scale, key, hs, T*hs, dpreatt, T, T*T, 0.0f, dquery, hs, T*hs, B*NH, {ev_dpreatt});
 
-        const float *query = inp + h * hs;
-        //const int ldq = C3;
-        float *dkey = dinp + h * hs + C;
-        //const int ldk = C3;
-        last = oneapi::mkl::blas::column_major::gemm_batch(queue,
-                oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0f, dkey, ldk, T*C3, B, {last});
-        // row_major gemm_batch apparently not supported in cuBLAS
-        //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
-        //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0f, dkey, ldk, T*C3, B, {last});
-    }
+    sycl::event ev_dkey = oneapi::mkl::blas::column_major::gemm_batch(queue,
+            oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+            hs, T, T, scale, query, hs, T*hs, dpreatt, T, T*T, 0.0f, dkey, hs, T*hs, B*NH, {ev_dpreatt});
+
+    // Reorder QKV horizontally (T dimension unchanged):
+    // From 3*Tx(B*C), i.e., QKV to B*(Tx3*C), i.e., QKVQKV...QKV
+    sycl::event last = permute_backward(queue, dinp, dqkvr, B, T, C, NH, {ev_dquery, ev_dkey, ev_dvalue});
 
     return last;
 }
 
 sycl::event attention_backward(sycl::queue &queue, float* dinp, float* dpreatt, float* datt,
-                               const float* dout, const float* inp, const float* att,
+                               float* dscratch, const float* dout, const float* inp, const float* att,
                                const int B, const int T, const int C, const int NH,
                                const std::vector<sycl::event> &dependencies = {}) {
-    return attention_backward_onemkl_interfaces(queue, dinp, dpreatt, datt, dout, inp, att, B, T, C, NH, dependencies);
+    return attention_backward_onemkl_interfaces(queue, dinp, dpreatt, datt, dscratch, dout, inp, att, B, T, C, NH, dependencies);
 }
 
 #else
@@ -1719,13 +1815,13 @@ float* malloc_and_point_parameters(sycl::queue &queue, ParameterTensors* params,
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 23
+#define NUM_ACTIVATION_TENSORS 24
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
-    float* qkv; // (L, B, T, 3*C)
+    float* qkvr; // (L, B, T, 3*C) // REOREDERED QKV compared to train_gpt2.c!
     float* atty; // (L, B, T, C)
     float* preatt; // (L, B, NH, T, T)
     float* att; // (L, B, NH, T, T)
@@ -1744,6 +1840,7 @@ typedef struct {
     float* logits; // (B, T, V)
     float* probs; // (B, T, V)
     float* losses; // (B, T)
+    float* scratch; // (4, B, NH, T, (C/NH)) temporary workspace
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
@@ -1755,7 +1852,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T;  // ln1_mean
     act_sizes[3] = L * B * T;  // ln1_rstd
-    act_sizes[4] = L * B * T * 3*C; // qkv
+    act_sizes[4] = L * B * T * 3*C; // qkvr < REOERDERED compared to train_gpt2.c!
     act_sizes[5] = L * B * T * C;  // atty
     act_sizes[6] = L * B * NH * T * T;  // preatt
     act_sizes[7] = L * B * NH * T * T;  // att
@@ -1774,6 +1871,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[20] = B * T * Vp; // logits
     act_sizes[21] = B * T * Vp; // probs
     act_sizes[22] = B * T; // losses
+    act_sizes[23] = 4 * B * NH * T * (C / NH); // B*NH*T*HS padding
 }
 
 float* malloc_and_point_activations(sycl::queue &queue, ActivationTensors* acts, size_t* act_sizes) {
@@ -1784,10 +1882,10 @@ float* malloc_and_point_activations(sycl::queue &queue, ActivationTensors* acts,
     }
     float* acts_memory = (float*)xxxMallocCheck(num_activations * sizeof(float), queue);
     float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
+        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkvr, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses, &acts->scratch
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -2033,7 +2131,7 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_preatt = acts.preatt + l * B * NH * T * T;
         float* l_att = acts.att + l * B * NH * T * T;
@@ -2058,13 +2156,13 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
         clock_gettime(CLOCK_MONOTONIC, &end);
         ln_ms += get_elapsed_ms(start, end);
 #endif
-        auto ev_mm = matmul_forward(queue, l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, {ev_ln});
+        auto ev_mm = matmul_forward(queue, acts.scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, {ev_ln});
 #if (TIMEPROFILE >= 2)
         ev_mm.wait();
         clock_gettime(CLOCK_MONOTONIC, &start);
         ln_ms += get_elapsed_ms(end, start);
 #endif
-        auto ev_at = attention_forward(queue, l_atty, l_preatt, l_att, l_qkv, B, T, C, NH, {ev_mm});
+        auto ev_at = attention_forward(queue, l_atty, l_preatt, l_att, l_qkvr, acts.scratch, B, T, C, NH, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_at.wait();
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -2349,7 +2447,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
         float* l_residual2 = acts.residual2 + l * B * T * C;
@@ -2365,6 +2463,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         float* dl_bt4c = grads_acts.bt4c;
         float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att;
+        float* dscratch = acts.scratch;
 
 #if (TIMEPROFILE >= 2)
         ev_last.wait();
@@ -2404,7 +2503,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         clock_gettime(CLOCK_MONOTONIC, &end);
         mm_ms += get_elapsed_ms(start, end);
 #endif
-        auto ev_at = attention_backward(queue, dl_bt4c, dl_preatt, dl_att, dl_btc, l_qkv, l_att, B, T, C, NH, {ev_mm});
+        auto ev_at = attention_backward(queue, dl_bt4c, dl_preatt, dl_att, dscratch, dl_btc, l_qkvr, l_att, B, T, C, NH, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_at.wait();
         clock_gettime(CLOCK_MONOTONIC, &start);
