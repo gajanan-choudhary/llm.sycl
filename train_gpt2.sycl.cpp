@@ -592,16 +592,16 @@ sycl::event matmul_backward_onemkl_interfaces(sycl::queue &queue, float* dinp, f
     // row-major is not supported, so we must flip-around some things to get
     // what we want with column-major GEMM.
 
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
+    const float zero = 0.0f;
+    const float one  = 1.0f;
     const oneapi::mkl::transpose opNonTrans = oneapi::mkl::transpose::nontrans;
     const oneapi::mkl::transpose opTrans    = oneapi::mkl::transpose::trans;
 
     sycl::event ev_dinp = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opNonTrans,
-            C, B*T, OC, alpha, weight, C, dout, OC, beta, dinp, C, dependencies);
+            C, B*T, OC, one, weight, C, dout, OC, zero, dinp, C, dependencies);
 
     sycl::event ev_dweight = oneapi::mkl::blas::column_major::gemm(queue, opNonTrans, opTrans,
-            C, OC, B*T, alpha, inp, C, dout, OC, beta, dweight, C, {ev_dinp});
+            C, OC, B*T, one, inp, C, dout, OC, one, dweight, C, {ev_dinp});
 
     // backward into bias, parallelize over output channels OC
     sycl::event ev_dbias = ev_dweight; //sycl::event();
@@ -660,7 +660,7 @@ sycl::event matmul_backward2(sycl::queue &queue, float* dinp, float* dweight, fl
             for (int o = 0; o < OC; ++o) {
                 val += weight[o * C + c] * dout[bt * OC + o];
             }
-            dinp[bt * C + c] += val;
+            dinp[bt * C + c] = val;
         };
         cgh.parallel_for<class ker_matmul_backward2_dinp<SG_SIZE>>(
                 sycl::nd_range<2>(sycl::range<2>(ceilBT, ceilC),
@@ -767,11 +767,11 @@ sycl::event attention_forward_onemkl_interfaces(sycl::queue &queue, float* out, 
         const int ldp = T;
         depends_qdotk[b] = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-                T, T, hs, scale, key, ldk, hs, query, ldq, hs, 0.0, preatt_bh, ldp, T*T, NH, dependencies);
+                T, T, hs, scale, key, ldk, hs, query, ldq, hs, 0.0f, preatt_bh, ldp, T*T, NH, dependencies);
         // row_major gemm_batch apparently not supported in cuBLAS
         //depends_qdotk[b] = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-        //        T, T, hs, scale, query, ldq, hs, key, ldk, hs, 0.0, preatt_bh, ldp, T*T, NH, dependencies);
+        //        T, T, hs, scale, query, ldq, hs, key, ldk, hs, 0.0f, preatt_bh, ldp, T*T, NH, dependencies);
     }
 
     sycl::event ev_softmax = queue.submit([&](sycl::handler &cgh) {
@@ -833,11 +833,11 @@ sycl::event attention_forward_onemkl_interfaces(sycl::queue &queue, float* out, 
         const int ldo = C;
         depends_av[h] = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                hs, T, T, 1.0, value, ldv, T * C3, att_bh, lda, NH*T*T, 0.0, out_bh, ldo, T * C, B, {ev_softmax});
+                hs, T, T, 1.0f, value, ldv, T * C3, att_bh, lda, NH*T*T, 0.0f, out_bh, ldo, T * C, B, {ev_softmax});
         // row_major gemm_batch apparently not supported in cuBLAS
         //depends_av[h] = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, 1.0, att_bh, lda, NH*T*T, value, ldv, T * C3, 0.0, out_bh, ldo, T * C, B, {ev_softmax});
+        //        T, hs, T, 1.0f, att_bh, lda, NH*T*T, value, ldv, T * C3, 0.0f, out_bh, ldo, T * C, B, {ev_softmax});
     }
     return queue.ext_oneapi_submit_barrier(depends_av);
 }
@@ -998,7 +998,7 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         const int lda = T;
         ev_datt = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 1.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
+                T, T, hs, 1.0f, value, ldv, T * C3, dout_bh, ldo, T * C, 0.0f, datt_bh, lda, NH*T*T, B, {ev_datt});
         // row_major gemm_batch apparently not supported in cuBLAS
         //ev_datt = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
@@ -1010,7 +1010,7 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         //const int ldv = C3;
         ev_dval = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 1.0f, dvalue, ldv, T * C3, B, {ev_dval});
+                hs, T, T, 1.0f, dout_bh, ldo, T * C, att_bh, lda, NH*T*T, 0.0f, dvalue, ldv, T * C3, B, {ev_dval});
         // row_major gemm_batch apparently not supported in cuBLAS
         //ev_dval = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
@@ -1054,7 +1054,7 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
                 const float local_derivative = -att_bth[t2] * att_bth_t3;
                 dpreatt_val += local_derivative * datt_bth[t2];
             }
-            dpreatt_bth[t3] += dpreatt_val;
+            dpreatt_bth[t3] = dpreatt_val;
         };
         cgh.parallel_for<class ker_attention_backward_onemkl_interfaces_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
@@ -1075,11 +1075,11 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         const int ldq = C3;
         last = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dquery, ldq, T*C3, B, {last});
+                hs, T, T, scale, key, ldk, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0f, dquery, ldq, T*C3, B, {last});
         // row_major gemm_batch apparently not supported in cuBLAS
         //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0, dquery, ldq, T*C3, B, {last});
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, key, ldk, T*C3, 0.0f, dquery, ldq, T*C3, B, {last});
 
         const float *query = inp + h * hs;
         //const int ldq = C3;
@@ -1087,11 +1087,11 @@ sycl::event attention_backward_onemkl_interfaces(sycl::queue &queue, float* dinp
         //const int ldk = C3;
         last = oneapi::mkl::blas::column_major::gemm_batch(queue,
                 oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0, dkey, ldk, T*C3, B, {last});
+                hs, T, T, scale, query, ldq, T*C3, dpreatt_bh, ldp, NH*T*T, 0.0f, dkey, ldk, T*C3, B, {last});
         // row_major gemm_batch apparently not supported in cuBLAS
         //last = oneapi::mkl::blas::row_major::gemm_batch(queue,
         //        oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0, dkey, ldk, T*C3, B, {last});
+        //        T, hs, T, scale, dpreatt_bh, ldp, NH*T*T, query, ldq, T*C3, 0.0f, dkey, ldk, T*C3, B, {last});
     }
 
     return last;
@@ -1140,7 +1140,7 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
                     // so now we have:
                     datt_val += value_t2[i] * dout_bth[i];
                 }
-                datt_bth[t2] += datt_val;
+                datt_bth[t2] = datt_val;
             }
         };
         cgh.parallel_for<class ker_attention_backward_2_datt>(sycl::range<3>(B, NH, T), kernel);
@@ -1166,7 +1166,7 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
                 const float* att_bth  = att  + b*NH*T*T + h*T*T + t*T;
                 dvalue_t2i += att_bth[t2] * dout_bth[i];
             }
-            dvalue_t2[i] += dvalue_t2i;
+            dvalue_t2[i] = dvalue_t2i;
         };
         cgh.parallel_for<class ker_attention_backward_2_dvalue>(sycl::range<3>(B*T, NH, hs), kernel);
     });
@@ -1197,7 +1197,7 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
                 const float local_derivative = -att_bth[t2] * att_bth_t3;
                 dpreatt_val += local_derivative * datt_bth[t2];
             }
-            dpreatt_bth[t3] += dpreatt_val;
+            dpreatt_bth[t3] = dpreatt_val;
         };
         cgh.parallel_for<class ker_attention_backward_2_dpreatt>(sycl::range<3>(B*NH, T, T), kernel);
     });
@@ -1216,14 +1216,16 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
 
             const float* key_bh = inp  + b * T * C3 + h * hs + C; // +C because it's key
 
+            float dquery_ti_unscaled = 0.0f;
             // backward pass 1, the query @ key matmul
             #ifndef SYCL_CUDA // Gives unable-to-unroll warnings otherwise
             #pragma unroll
             #endif
             for (int t2 = 0; t2 <= t; t2++) {
-                const float* key_t2 = key_bh  + t2 * C3;
-                dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
+                const float* key_t2 = key_bh + t2 * C3;
+                dquery_ti_unscaled += key_t2[i] * dpreatt_bth[t2];
             }
+            dquery_t[i] = dquery_ti_unscaled * scale;
         };
         cgh.parallel_for<class ker_attention_backward_2_dquery>(sycl::range<3>(B*T, NH, hs), kernel);
     });
@@ -1247,7 +1249,7 @@ sycl::event attention_backward2(sycl::queue &queue, float* dinp, float* dpreatt,
                 const float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
                 dkey_t2i += query_t[i] * dpreatt_bth[t2] * scale;
             }
-            dkey_t2[i] += dkey_t2i;
+            dkey_t2[i] = dkey_t2i;
         };
         cgh.parallel_for<class ker_attention_backward_2_dkey>(sycl::range<3>(B*T, NH, hs), kernel);
     });
@@ -1316,8 +1318,10 @@ class ker_gelu_backward_2;
 //#endif
 template<int SG_SIZE>
 sycl::event gelu_backward2(sycl::queue &queue, float* dinp,
-                           const float* inp, const float* dout, const int N, const int sg_per_wg,
+                           float* inp, float* dout, const int N, const int sg_per_wg,
                            const std::vector<sycl::event> &dependencies = {}) {
+    // dout is aliased over dinp in the actual gelu_backward call, that's why
+    // we don't have `const`s over `inp`/`dout`.
     const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
     const int wg_size = adjusted_sg_per_wg * SG_SIZE;
     const int ceilN = ((N + wg_size - 1) / wg_size) * wg_size;
@@ -1344,7 +1348,7 @@ sycl::event gelu_backward2(sycl::queue &queue, float* dinp,
 //#pragma float_control(pop)
 
 sycl::event gelu_backward(sycl::queue &queue, float* dinp,
-                          const float* inp, const float* dout, const int N,
+                          float* inp, float* dout, const int N,
                           const std::vector<sycl::event> &dependencies = {}) {
     ftrace();
 #if defined(SYCL_CPU)
@@ -1395,49 +1399,6 @@ sycl::event residual_forward(sycl::queue &queue, float* dinp,
 #else
     constexpr int sg_per_wg = 32;
     return residual_forward2<32>(queue, dinp, inp, dout, N, sg_per_wg, dependencies);
-#endif
-}
-
-template <int SG_SIZE>
-class ker_residual_backward_2;
-
-template<int SG_SIZE>
-sycl::event residual_backward2(sycl::queue &queue, float* dinp1, float* dinp2,
-                               const float* dout, const int N, const int sg_per_wg,
-                               const std::vector<sycl::event> &dependencies = {}) {
-    const int adjusted_sg_per_wg = std::min((N + SG_SIZE - 1) / SG_SIZE, sg_per_wg);
-    const int wg_size = adjusted_sg_per_wg * SG_SIZE;
-    const int ceilN = ((N + wg_size - 1) & (-wg_size));
-
-    sycl::event last = queue.submit([&](sycl::handler &cgh) {
-        cgh.depends_on(dependencies);
-        auto kernel = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            const size_t i = item.get_global_id(0);
-            if (i < N) {
-                const float d = dout[i];
-                dinp1[i] += d;
-                dinp2[i] += d;
-            }
-        };
-        cgh.parallel_for<class ker_residual_backward_2<SG_SIZE>>(
-                sycl::nd_range<1>(sycl::range<1>(ceilN), sycl::range<1>(wg_size)), kernel);
-    });
-    return last;
-}
-
-sycl::event residual_backward(sycl::queue &queue, float* dinp1, float* dinp2,
-                              const float* dout, const int N,
-                              const std::vector<sycl::event> &dependencies = {}) {
-    ftrace();
-#if defined(SYCL_CPU)
-    constexpr int sg_per_wg = 8;
-    return residual_backward2<16>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
-#elif defined(SYCL_CUDA)
-    constexpr int sg_per_wg = 32;
-    return residual_backward2<32>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
-#else
-    constexpr int sg_per_wg = 32;
-    return residual_backward2<32>(queue, dinp1, dinp2, dout, N, sg_per_wg, dependencies);
 #endif
 }
 
@@ -1785,6 +1746,36 @@ typedef struct {
     float* losses; // (B, T)
 } ActivationTensors;
 
+void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+    size_t Vp = config.padded_vocab_size;
+    size_t L = config.num_layers;
+    size_t NH = config.num_heads;
+    size_t C = config.channels;
+    act_sizes[0] = B * T * C; // encoded
+    act_sizes[1] = L * B * T * C; // ln1
+    act_sizes[2] = L * B * T;  // ln1_mean
+    act_sizes[3] = L * B * T;  // ln1_rstd
+    act_sizes[4] = L * B * T * 3*C; // qkv
+    act_sizes[5] = L * B * T * C;  // atty
+    act_sizes[6] = L * B * NH * T * T;  // preatt
+    act_sizes[7] = L * B * NH * T * T;  // att
+    act_sizes[8] = L * B * T * C; // attproj
+    act_sizes[9] = L * B * T * C; // residual2
+    act_sizes[10] = L * B * T * C; // ln2
+    act_sizes[11] = L * B * T; // ln2_mean
+    act_sizes[12] = L * B * T; // ln2_rstd
+    act_sizes[13] = L * B * T * 4*C; // fch
+    act_sizes[14] = L * B * T * 4*C; // fch_gelu
+    act_sizes[15] = L * B * T * C; // fcproj
+    act_sizes[16] = L * B * T * C; // residual3
+    act_sizes[17] = B * T * C; // lnf
+    act_sizes[18] = B * T; // lnf_mean
+    act_sizes[19] = B * T; // lnf_rstd
+    act_sizes[20] = B * T * Vp; // logits
+    act_sizes[21] = B * T * Vp; // probs
+    act_sizes[22] = B * T; // losses
+}
+
 float* malloc_and_point_activations(sycl::queue &queue, ActivationTensors* acts, size_t* act_sizes) {
     ftrace();
     size_t num_activations = 0;
@@ -1800,6 +1791,49 @@ float* malloc_and_point_activations(sycl::queue &queue, ActivationTensors* acts,
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        *(ptrs[i]) = acts_memory_iterator;
+        acts_memory_iterator += act_sizes[i];
+    }
+    return acts_memory;
+}
+
+// Backward pass is conceptually quite different from forward, because we can discard
+// the activations of a layer as soon as we're done with it. This lets us aggressively
+// reuse memory, so that we need far fewer tensors for backward state.
+#define NUM_BACKWARD_TENSORS 6
+typedef struct {
+    float* bt4c; // (B, T, 4*C)
+    float* preatt; // (B, NH, T, T)
+    float* att; // (B, NH, T, T)
+    float* residual3; // (B, T, C)
+    float* btc; // (B, T, C)
+    float* logits; // (B, T, Vp)
+} GradActTensors;
+
+void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+    size_t Vp = config.padded_vocab_size;
+    size_t NH = config.num_heads;
+    size_t C = config.channels;
+    act_sizes[0] = B * T * 4 * C; // bt4c
+    act_sizes[1] = B * NH * T * T; // preatt
+    act_sizes[2] = B * NH * T * T; // att
+    act_sizes[3] = B * T * C; // residual3
+    act_sizes[4] = B * T * C; // btc
+    act_sizes[5] = B * T * Vp; // logits
+}
+
+float* malloc_and_point_backward(sycl::queue &queue, GradActTensors* acts, const size_t* act_sizes) {
+    ftrace();
+    size_t num_activations = 0;
+    for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
+        num_activations += act_sizes[i];
+    }
+    float* acts_memory = (float*)xxxMallocCheck(num_activations * sizeof(float), queue);
+    float** ptrs[] = {
+        &acts->bt4c, &acts->preatt, &acts->att, &acts->residual3, &acts->btc, &acts->logits
+    };
+    float* acts_memory_iterator = acts_memory;
+    for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
         *(ptrs[i]) = acts_memory_iterator;
         acts_memory_iterator += act_sizes[i];
     }
@@ -1825,7 +1859,8 @@ typedef struct {
     float* acts_memory;
     size_t num_activations;
     // gradients of the activations
-    ActivationTensors grads_acts;
+    GradActTensors grads_acts;
+    size_t num_grad_acts;
     float* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
@@ -1932,29 +1967,7 @@ sycl::event gpt2_forward(sycl::queue &queue, GPT2 *model, int* inputs, int* targ
         model->batch_size = B;
         model->seq_len = T;
         // and now allocate the space
-        model->act_sizes[0] = B * T * C; // encoded
-        model->act_sizes[1] = L * B * T * C; // ln1
-        model->act_sizes[2] = L * B * T;  // ln1_mean
-        model->act_sizes[3] = L * B * T;  // ln1_rstd
-        model->act_sizes[4] = L * B * T * 3*C; // qkv
-        model->act_sizes[5] = L * B * T * C;  // atty
-        model->act_sizes[6] = L * B * NH * T * T;  // preatt
-        model->act_sizes[7] = L * B * NH * T * T;  // att
-        model->act_sizes[8] = L * B * T * C; // attproj
-        model->act_sizes[9] = L * B * T * C; // residual2
-        model->act_sizes[10] = L * B * T * C; // ln2
-        model->act_sizes[11] = L * B * T; // ln2_mean
-        model->act_sizes[12] = L * B * T; // ln2_rstd
-        model->act_sizes[13] = L * B * T * 4*C; // fch
-        model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
-        model->act_sizes[15] = L * B * T * C; // fcproj
-        model->act_sizes[16] = L * B * T * C; // residual3
-        model->act_sizes[17] = B * T * C; // lnf
-        model->act_sizes[18] = B * T; // lnf_mean
-        model->act_sizes[19] = B * T; // lnf_rstd
-        model->act_sizes[20] = B * T * Vp; // logits
-        model->act_sizes[21] = B * T * Vp; // probs
-        model->act_sizes[22] = B * T; // losses
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -2194,7 +2207,7 @@ sycl::event gpt2_zero_grad(sycl::queue &queue, GPT2 *model,
         depends.push_back(ev_zero_grads_memory);
     }
     if(model->grads_acts_memory != NULL) {
-        auto ev_zero_grads_acts_memory = queue.fill<float>(model->grads_acts_memory, 0.0f, model->num_activations, dependencies);
+        auto ev_zero_grads_acts_memory = queue.fill<float>(model->grads_acts_memory, 0.0f, model->num_grad_acts, dependencies);
         depends.push_back(ev_zero_grads_acts_memory);
     }
     return queue.ext_oneapi_submit_barrier(depends);
@@ -2216,13 +2229,28 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     struct timespec start, end;
     // Variables for tracking wall-clock timings
     double il_ms = 0.0, cs_ms = 0.0, mm_ms = 0.0, ln_ms = 0.0;
-    double rs_ms = 0.0, ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
+    double ec_ms = 0.0, at_ms = 0.0, gl_ms = 0.0;
 #endif
     // lazily allocate the memory for gradients of the weights and activations, if needed
     std::vector<sycl::event> depends = dependencies;
     if (model->grads_memory == NULL) {
         model->grads_memory = malloc_and_point_parameters(queue, &model->grads, model->param_sizes);
-        model->grads_acts_memory = malloc_and_point_activations(queue, &model->grads_acts, model->act_sizes);
+        printf("allocated %zu MiB for parameter gradients\n", (model->num_parameters * sizeof(float)) >> 20);
+        // we're going to be clever for the activations backward pass. we don't need to exactly
+        // mirror the forward pass acrtivations and we will save memory.
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
+        {
+            GPT2Config cfg = model->config; // temporary copy
+            cfg.num_layers = 1; // copy the configuration but override number of layers to 1
+            fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        }
+        // count up and allocate the space
+        model->grads_acts_memory = malloc_and_point_backward(queue, &model->grads_acts, bw_act_sizes);
+        model->num_grad_acts = 0;
+        for (int i = 0; i < NUM_BACKWARD_TENSORS; i++) {
+            model->num_grad_acts += bw_act_sizes[i];
+        }
+        printf("allocated %zu MiB for activation gradients\n", (model->num_grad_acts * sizeof(float)) >> 20);
 
 #if (TIMEPROFILE >= 2)
         queue.wait();
@@ -2252,7 +2280,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
-    ActivationTensors grads_acts = model->grads_acts;
+    GradActTensors grads_acts = model->grads_acts;
 
     // do a training step
 #if (TIMEPROFILE >= 2)
@@ -2263,7 +2291,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     // technically this is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     const float dloss_mean = 1.0f / (B*T);
-    auto ev_init_loss = queue.fill<float>(grads_acts.losses, dloss_mean, B * T, depends);
+    auto ev_init_loss = queue.fill<float>(grads_acts.bt4c, dloss_mean, B * T, depends);
 
 #if (TIMEPROFILE >= 2)
     ev_init_loss.wait();
@@ -2271,21 +2299,22 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     il_ms += get_elapsed_ms(start, end);
 #endif
 
-    auto ev_ce_sm = crossentropy_softmax_backward(queue, grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp, {ev_init_loss});
+    auto ev_ce_sm = crossentropy_softmax_backward(queue, grads_acts.logits, grads_acts.bt4c, acts.probs, model->targets, B, T, V, Vp, {ev_init_loss});
 #if (TIMEPROFILE >= 2)
     ev_ce_sm.wait();
     clock_gettime(CLOCK_MONOTONIC, &start);
     cs_ms += get_elapsed_ms(end, start);
 #endif
-    auto ev_mm = matmul_backward(queue, grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp, {ev_ce_sm});
+    // Ensure that matmul_backward call to fill bt4c uses beta = 0.0
+    auto ev_mm = matmul_backward(queue, grads_acts.bt4c, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp, {ev_ce_sm});
 #if (TIMEPROFILE >= 2)
     ev_mm.wait();
     clock_gettime(CLOCK_MONOTONIC, &end);
     mm_ms += get_elapsed_ms(start, end);
 #endif
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
-    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
-    auto ev_ln = layernorm_backward(queue, dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, {ev_mm});
+    float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
+    auto ev_ln = layernorm_backward(queue, dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, {ev_mm});
 #if (TIMEPROFILE >= 2)
     ev_ln.wait();
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -2294,9 +2323,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
 
     sycl::event ev_last = ev_ln;
     for (int l = L-1; l >= 0; l--) {
-
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-        dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
@@ -2332,83 +2359,69 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
-        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
-        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
-        float* dl_atty = grads_acts.atty + l * B * T * C;
-        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
-        float* dl_att = grads_acts.att + l * B * NH * T * T;
-        float* dl_attproj = grads_acts.attproj + l * B * T * C;
-        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
-        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
-        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
-        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
-        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
-        float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
+        // notice that there is no l *, because we just have a single copy, and keep
+        // re-using this memory in every Transformer block as we calculate backward pass
+        float* dl_btc = grads_acts.btc;
+        float* dl_bt4c = grads_acts.bt4c;
+        float* dl_preatt = grads_acts.preatt;
+        float* dl_att = grads_acts.att;
 
 #if (TIMEPROFILE >= 2)
         ev_last.wait();
-        clock_gettime(CLOCK_MONOTONIC, &end);
+        clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
         // backprop this layer
-        auto ev_rs = residual_backward(queue, dl_residual2, dl_fcproj, dl_residual3, B*T*C, {ev_last});
-#if (TIMEPROFILE >= 2)
-        ev_rs.wait();
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        rs_ms += get_elapsed_ms(end, start);
-#endif
-        ev_mm = matmul_backward(queue, dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C, {ev_rs});
+        ev_mm = matmul_backward(queue, dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C, {ev_last});
 #if (TIMEPROFILE >= 2)
         ev_mm.wait();
         clock_gettime(CLOCK_MONOTONIC, &end);
         mm_ms += get_elapsed_ms(start, end);
 #endif
-        auto ev_gl = gelu_backward(queue, dl_fch, l_fch, dl_fch_gelu, B*T*4*C, {ev_mm});
+        // CAUTION: pointer aliasing here! The right dl_bt4c is passed in as `dout,
+        // but left dl_bt4c is passed in as `dinp` and is modified in-place!
+        auto ev_gl = gelu_backward(queue, dl_bt4c, l_fch, dl_bt4c, B*T*4*C, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_gl.wait();
         clock_gettime(CLOCK_MONOTONIC, &start);
         gl_ms += get_elapsed_ms(end, start);
 #endif
-        ev_mm = matmul_backward(queue, dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C, {ev_gl});
+        ev_mm = matmul_backward(queue, dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4*C, {ev_gl});
 #if (TIMEPROFILE >= 2)
         ev_mm.wait();
         clock_gettime(CLOCK_MONOTONIC, &end);
         mm_ms += get_elapsed_ms(start, end);
 #endif
-        ev_ln = layernorm_backward(queue, dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, {ev_mm});
+        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        ev_ln = layernorm_backward(queue, dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_ln.wait();
         clock_gettime(CLOCK_MONOTONIC, &start);
         ln_ms += get_elapsed_ms(end, start);
 #endif
-        ev_rs = residual_backward(queue, dresidual, dl_attproj, dl_residual2, B*T*C, {ev_ln});
-#if (TIMEPROFILE >= 2)
-        ev_rs.wait();
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        rs_ms += get_elapsed_ms(start, end);
-#endif
-        ev_mm = matmul_backward(queue, dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C, {ev_rs});
+        ev_mm = matmul_backward(queue, dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C, {ev_ln});
 #if (TIMEPROFILE >= 2)
         ev_mm.wait();
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        mm_ms += get_elapsed_ms(end, start);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
 #endif
-        auto ev_at = attention_backward(queue, dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH, {ev_mm});
+        auto ev_at = attention_backward(queue, dl_bt4c, dl_preatt, dl_att, dl_btc, l_qkv, l_att, B, T, C, NH, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_at.wait();
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        at_ms += get_elapsed_ms(start, end);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        at_ms += get_elapsed_ms(end, start);
 #endif
-        ev_mm = matmul_backward(queue, dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C, {ev_at});
+        ev_mm = matmul_backward(queue, dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3*C, {ev_at});
 #if (TIMEPROFILE >= 2)
         ev_mm.wait();
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        mm_ms += get_elapsed_ms(end, start);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        mm_ms += get_elapsed_ms(start, end);
 #endif
-        ev_ln = layernorm_backward(queue, dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, {ev_mm});
+        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the Attention block above
+        ev_ln = layernorm_backward(queue, dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, {ev_mm});
 #if (TIMEPROFILE >= 2)
         ev_ln.wait();
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        ln_ms += get_elapsed_ms(start, end);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        ln_ms += get_elapsed_ms(end, start);
 #endif
         ev_last = ev_ln;
     }
@@ -2417,7 +2430,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
     ev_last.wait();
     clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
-    auto ev_enc = encoder_backward(queue, grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C, {ev_last});
+    auto ev_enc = encoder_backward(queue, grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, {ev_last});
 #if (TIMEPROFILE >= 2)
     ev_enc.wait();
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -2427,7 +2440,7 @@ sycl::event gpt2_backward(sycl::queue &queue, GPT2 *model,
 #if (TIMEPROFILE >= 2)
     if (dump_timings) {
         printf("[BWD] il_ms = %10.3f, cs_ms = %10.3f, mm_ms = %10.3f, ln_ms = %10.3f\n", il_ms, cs_ms, mm_ms, ln_ms);
-        printf("[BWD] rs_ms = %10.3f, gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", rs_ms, gl_ms, at_ms, ec_ms);
+        printf("[BWD]                     gl_ms = %10.3f, at_ms = %10.3f, ec_ms = %10.3f\n", gl_ms, at_ms, ec_ms);
     }
 #endif
 
@@ -2552,12 +2565,13 @@ int main() {
     struct timespec start, end;
     sycl::event last = sycl::event();
     // probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
-    // probs_host is the host copy of those
-    float *probs_host = (float *)hostMallocCheck(B * T * model.config.padded_vocab_size * sizeof(float), queue);
+    // probs_host is the host copy of one set (length V) of those
+    float *probs_host = (float *)hostMallocCheck(model.config.vocab_size * sizeof(float), queue);
     for (int step = 0; step <= 40; step++) {
+        int last_step = step == 40;
 
         // once in a while estimate the validation loss
-        if (step % 10 == 0) {
+        if (step % 10 == 0 || last_step) {
             float val_loss = 0.0f;
             last.wait(); // Wait before resetting
             dataloader_reset(&val_loader);
@@ -2572,7 +2586,7 @@ int main() {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
+        if (step > 0 && step % 20 == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             last = queue.fill<int>(gen_tokens, tokenizer.eot_token, B * T, {last});
             // now sample from the model autoregressively
@@ -2588,13 +2602,13 @@ int main() {
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
                 // get the Vp-dimensional vector probs[0, t-1, :]
-                last = queue.memcpy(probs_host, model.acts.probs, B * T * model.config.padded_vocab_size * sizeof(float), {last});
+                float *probs_device = model.acts.probs + (t-1) * model.config.padded_vocab_size;
+                last = queue.memcpy(probs_host, probs_device, model.config.vocab_size * sizeof(float), {last});
                 last.wait();
-                float* probs = probs_host + (t-1) * model.config.padded_vocab_size;
                 float coin = random_f32(&rng_state);
                 // note we're only sampling from the first V elements, ignoring padding
                 // (the probabilities in the padded region should be zero anyway)
-                int next_token = sample_mult(probs, model.config.vocab_size, coin);
+                int next_token = sample_mult(probs_host, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
                 if (tokenizer.init_ok) {
@@ -2608,6 +2622,12 @@ int main() {
             }
             printf("\n---\n");
         }
+
+        // bit confusing: we want to make sure to eval and sample on 0th iteration
+        // but also after the very last iteration. so we loop for step <= train_num_batches
+        // instead of just < train_num_batches (one extra due to <=), only to do
+        // the validation/sampling one last time, and then we break right here as we're done.
+        if (last_step) { break; }
 
         // do a training step
         last.wait(); // Wait before loading next batch
