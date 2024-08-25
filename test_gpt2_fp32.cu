@@ -5,21 +5,33 @@
 int check_tensor(float *a, float *b, int n, const char* label) {
     int print_upto = 5;
     int ok = 1;
+    float maxdiff = 0.0f;
+    float tol = 1e-2f;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabsf(a[i] - b[i]) <= 1e-2) {
-            if (i < print_upto) { printf("OK "); }
-        } else {
-            if (i < print_upto) { printf("NOT OK "); }
-            ok = 0;
+        // look at the diffence at position i of these two tensors
+        float diff = fabsf(a[i] - b[i]);
+
+        // keep track of the overall error
+        ok = ok && (diff <= tol);
+        if (diff > maxdiff) { maxdiff = diff; }
+
+        // for the first few elements of each tensor, pretty print
+        // the actual numbers, so we can do a visual, qualitative proof/assessment
+        if (i < print_upto) {
+            if (diff <= tol) {
+                if (i < print_upto) { printf("OK "); }
+            } else {
+                if (i < print_upto) { printf("NOT OK "); }
+            }
+            printf("%f %f\n", a[i], b[i]);
         }
-        if (i < print_upto) { printf("%f %f\n", a[i], b[i]); }
     }
-    // print the final result
+    // print the final result for this tensor
     if (ok) {
-        printf("TENSOR OK\n");
+        printf("TENSOR OK, maxdiff = %e\n", maxdiff);
     } else {
-        printf("TENSOR NOT OK\n");
+        printf("TENSOR NOT OK, maxdiff = %e\n", maxdiff);
     }
     return ok;
 }
@@ -48,11 +60,11 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    // int C = model.config.channels;
+    int C = model.config.channels;
     int V = model.config.vocab_size;
     int Vp = model.config.padded_vocab_size;
     int maxT = model.config.max_seq_len;
-    // int L = model.config.num_layers;
+    int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
@@ -123,7 +135,7 @@ int main(int argc, char *argv[]) {
     }
     allok = allok && logits_ok;
     if(!logits_ok) { printf("NOT "); }
-    printf("OK (LOGITS)\n");
+    printf("OK (LOGITS), max_diff = %e\n", max_diff);
 
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
@@ -149,42 +161,30 @@ int main(int argc, char *argv[]) {
             }
 
             // and now compare the gradients on the parameters
-            // cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.lnfb, model.grads.lnfb, C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcprojw, model.grads.fcprojw, L * C * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcprojb, model.grads.fcprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcw, model.grads.fcw, L * 4*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcb, model.grads.fcb, L * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln2w, model.grads.ln2w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln2b, model.grads.ln2b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.attprojw, model.grads.attprojw, L * C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.attprojb, model.grads.attprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.qkvw, model.grads.qkvw, L * 3*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.qkvb, model.grads.qkvb, L * 3*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln1w, model.grads.ln1w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln1b, model.grads.ln1b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.wte, model.grads.wte, V * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.wpe, model.grads.wpe, maxT * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
-            // check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
-            // check_tensor(calculated_grads.fcprojw, expected_grads.fcprojw, L * C * 4*C, "fcprojw");
-            // check_tensor(calculated_grads.fcprojb, expected_grads.fcprojb, L * C, "fcprojb");
-            // check_tensor(calculated_grads.fcw, expected_grads.fcw, L * 4*C * C, "fcw");
-            // check_tensor(calculated_grads.fcb, expected_grads.fcb, L * 4*C, "fcb");
-            // check_tensor(calculated_grads.ln2w, expected_grads.ln2w, L * C, "ln2w");
-            // check_tensor(calculated_grads.ln2b, expected_grads.ln2b, L * C, "ln2b");
-            // check_tensor(calculated_grads.attprojw, expected_grads.attprojw, L * C * C, "attprojw");
-            // check_tensor(calculated_grads.attprojb, expected_grads.attprojb, L * C, "attprojb");
-            // check_tensor(calculated_grads.qkvw, expected_grads.qkvw, L * 3*C * C, "qkvw");
-            // check_tensor(calculated_grads.qkvb, expected_grads.qkvb, L * 3*C, "qkvb");
-            // check_tensor(calculated_grads.ln1w, expected_grads.ln1w, L * C, "ln1w");
-            // check_tensor(calculated_grads.ln1b, expected_grads.ln1b, L * C, "ln1b");
-            // check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
-            // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
+            int gradoks[16];
+            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
+            gradoks[0] = check_tensor(calculated_grads.wte, expected_grads.wte, V*C, "dwte");
+            gradoks[1] = check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT*C, "dwpe");
+            gradoks[2] = check_tensor(calculated_grads.ln1w, expected_grads.ln1w, L*C, "dln1w");
+            gradoks[3] = check_tensor(calculated_grads.ln1b, expected_grads.ln1b, L*C, "dln1b");
+            gradoks[4] = check_tensor(calculated_grads.qkvw, expected_grads.qkvw, L*3*C*C, "dqkvw");
+            gradoks[5] = check_tensor(calculated_grads.qkvb, expected_grads.qkvb, L*3*C, "dqkvb");
+            gradoks[6] = check_tensor(calculated_grads.attprojw, expected_grads.attprojw, L*C*C, "dattprojw");
+            gradoks[7] = check_tensor(calculated_grads.attprojb, expected_grads.attprojb, L*C, "dattprojb");
+            gradoks[8] = check_tensor(calculated_grads.ln2w, expected_grads.ln2w, L*C, "dln2w");
+            gradoks[9] = check_tensor(calculated_grads.ln2b, expected_grads.ln2b, L*C, "dln2b");
+            gradoks[10] = check_tensor(calculated_grads.fcw, expected_grads.fcw, L*4*C*C, "dfcw");
+            gradoks[11] = check_tensor(calculated_grads.fcb, expected_grads.fcb, L*4*C, "dfcb");
+            gradoks[12] = check_tensor(calculated_grads.fcprojw, expected_grads.fcprojw, L*C*4*C, "dfcprojw");
+            gradoks[13] = check_tensor(calculated_grads.fcprojb, expected_grads.fcprojb, L*C, "dfcprojb");
+            gradoks[14] = check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "dlnfw");
+            gradoks[15] = check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "dlnfb");
+            for (int i = 0; i < 16; i++) {
+                allok = allok && gradoks[i];
+            }
 
             // compare the gradients ona the parameters all at once
-            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
-            check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "grads");
+            //allok = check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "grads");
         }
 
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
