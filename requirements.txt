@@ -1,5 +1,5 @@
 tqdm
-numpy<2
+numpy
 torch
 tiktoken
 transformers
