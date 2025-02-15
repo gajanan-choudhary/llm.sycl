@@ -257,7 +257,7 @@ class GPT(nn.Module):
         print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        use_fused = fused_available and (device_type == 'cuda' or device_type == 'xpu')
         print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
             print0("using ZeroRedundancyOptimizer")
@@ -615,8 +615,10 @@ if __name__ == "__main__":
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                device = "xpu"
     print(f"using device: {device}")
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    device_type = 'cuda' if 'cuda' in device else 'xpu' if 'xpu' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -627,11 +629,11 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" or device_type == "xpu" else nullcontext()
 
     # rng / reproducibility
     torch.manual_seed(42)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or torch.xpu.is_available():
         torch.cuda.manual_seed(42)
 
     # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
@@ -738,6 +740,8 @@ if __name__ == "__main__":
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    elif device == "xpu":
+        torch.xpu.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations + 1):
@@ -835,6 +839,8 @@ if __name__ == "__main__":
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
+        elif device == "xpu":
+            torch.xpu.synchronize()
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
@@ -852,7 +858,10 @@ if __name__ == "__main__":
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
-    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    if device == "cuda":
+        print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    elif device == "xpu":
+        print0(f"peak memory consumption: {torch.xpu.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
     # clean up nice
